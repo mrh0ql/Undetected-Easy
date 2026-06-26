@@ -3,6 +3,31 @@ Undetected Easy (UDE) is a detection scanner for finding Kernel Driver detection
 UDE was built around reverse-engineered routines primarily from **EasyAntiCheat, BattlEye and Vanguard**. <br />
 UDE gives developers a way around **ban waves** and **before anti-cheats can collect any other signatures**. <br />
 
+<details>
+  <summary>Table of Contents</summary>
+  <ol>
+    <li><a href="#how-does-ude-work">How does UDE work?</a></li>
+    <li><a href="#why-use-ude">Why use UDE?</a></li>
+    <li>
+      <a href="#what-does-ude-detect">What does UDE detect?</a>
+      <ul>
+        <li><a href="#module-integrity">Module Integrity</a></li>
+        <li><a href="#execution-integrity">Execution Integrity</a></li>
+        <li><a href="#memory-integrity">Memory Integrity</a></li>
+        <li><a href="#pool-integrity">Pool Integrity</a></li>
+        <li><a href="#process-integrity">Process Integrity</a></li>
+        <li><a href="#object-integrity">Object Integrity</a></li>
+        <li><a href="#service-integrity">Service Integrity</a></li>
+        <li><a href="#cpu-integrity">CPU Integrity</a></li>
+        <li><a href="#dpc-integrity">DPC Integrity</a></li>
+      </ul>
+    </li>
+    <li><a href="#tutorial">Tutorial</a></li>
+    <li><a href="#roadmap">Roadmap</a></li>
+    <li><a href="#conclusion">Conclusion</a></li>
+  </ol>
+</details>
+
 # How does UDE work?
 
 UDE is a **usermode interface** and a **kernel detection driver**. <br />
@@ -206,45 +231,54 @@ Anti-cheats can still inspect queued routines and **validate whether their targe
 </details>
 
 # Tutorial
+This tutorial shows **how to scan your kernel driver** using UDE. <br />
+The **recommended way** to scan your project is by **scanning before mapping your driver** to compare detections. <br />
 
-## 1. Open the solution
+1. Open `ude.sln` in **Visual Studio 2022 or 2026**. <br />
+   Make sure you have the **Windows Driver Kit (WDK)** installed before building the driver. <br />
 
-Open ude.sln in **Visual Studio 2022**. <br />
-Make sure you have the **Windows Driver Kit (WDK)** installed before building the driver. <br />
+2. Enable a test certificate for the driver. <br />
+   In Visual Studio, right click the `ude-driver` project and open **Properties**. <br />
+   Go to **Configuration Properties -> Driver Signing -> General** and set: <br />
+   * **Sign Mode:** `Test Sign`
+   * **Test Certificate:** create a new test certificate
+   * **Configuration:** `Release`
+   * **Platform:** `x64`
 
-## 2. Enable a test certificate for the driver
+3. Build both projects in **Release x64**. <br />
+   Build `ude-driver` first, then build `ude-usermode`. <br />
 
-In Visual Studio, right click the ude-driver project and open **Properties**. <br />
-Go to **Configuration Properties -> Driver Signing -> General**. <br />
+4. Open the build as Administrator. <br />
+   Run `ude-usermode.exe ude-driver.sys` from the build folder. <br />
 
-Set the driver signing options to:
+5. Press `Continue` when UDE opens. <br />
+   If test signing is not enabled, UDE will prompt you to enable it. <br />
+   After enabling test signing, restart Windows and run UDE again as Administrator. <br />
 
-* **Sign Mode:** Test Sign
-* **Test Certificate:** create a new test certificate
-* **Configuration:** Release
-* **Platform:** x64
+6. Run a scan before mapping your own kernel driver. <br />
+   This tells you if UDE has any false positives before testing your driver. <br />
 
-Apply the settings and save the project. <br />
+7. Map your kernel driver, then run the same scans again. <br />
+   Any new detections after mapping are likely caused by your driver. <br />
+   Review the dashboard and `ude-log.txt` for the target, violation, method, address, and suggested fix. <br />
 
-## 3. Build both projects
-
-Build the ude-driver project in **Release x64**. <br />
-And build the ude-usermode project in **Release x64**. <br />
-
-## 4. Open the build
-
-Run ```ude-usermode.exe ude-driver.sys``` as Administrator. <br />
-
-## 5. Enable test signing
-
-When UDE opens, press ```Continue```. If test signing is not enabled, you'll be prompted to enable test signing. <br />
-
-## 6. Scan for detections before and after mapping your kernel driver
-Run a scan before mapping your own kernel driver. <br />
-This will tell you if UDE has any false positives before running your driver. <br />
+> **Warning** <br />
+> After scanning, disable test signing and restart Windows before playing protected games. <br /> 
 
 https://github.com/user-attachments/assets/f961544d-8c7e-4de9-b48e-0ffb615ed956
 
 https://github.com/user-attachments/assets/b477a50b-409b-481a-afcd-d28c1b759b6f
 
-<img width="990" height="633" alt="image" src="https://github.com/user-attachments/assets/98063e96-0263-4d22-8c4c-a55f3db53e75" />
+<img width="948" height="582" alt="gfdgdfgdgfdgf" src="https://github.com/user-attachments/assets/247ca570-31ab-4f53-a097-644e32a744a5" />
+
+## Roadmap
+- [x] Add Changelog
+- [x] Finish Detection Categories
+- [ ] Add Vulernable Driver Blocklist Check
+- [ ] Add PatchGuard Context Check
+
+## Conclusion
+Undetected Easy is a **kernel detection scanner** made to find **driver detections before anti-cheats do**. <br />
+Using recreated integrity checks from **EasyAntiCheat, BattlEye, Vanguard**, and similar anti-cheats. <br />
+So you can test your driver before exposing it to a real environment. <br />
+Found issues or want to contribute? Create an issue or contact me on Discord. <br />
