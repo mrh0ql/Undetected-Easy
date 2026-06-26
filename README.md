@@ -6,7 +6,7 @@ UDE gives developers a way around **ban waves** and **before anti-cheats can col
 # How does UDE work?
 
 UDE is a **usermode interface** and a **kernel detection driver**. <br />
-The usermode client creates a **interactable interface** and communicates with the driver to find detections. <br />
+The usermode client creates a **interface** and **communicates** with the driver to find detections. <br />
 The **kernel driver handles the detection scanning logic** while the **usermode displays it**. <br />
 
 The driver creates a detection packet containing the **target, violation type, detection method, address, size, and status**. <br />
