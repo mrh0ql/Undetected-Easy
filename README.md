@@ -207,4 +207,44 @@ Anti-cheats can still inspect queued routines and **validate whether their targe
 
 # Tutorial
 
+## 1. Open the solution
 
+Open ude.sln in **Visual Studio 2022**. <br />
+Make sure you have the **Windows Driver Kit (WDK)** installed before building the driver. <br />
+
+## 2. Enable a test certificate for the driver
+
+In Visual Studio, right click the ude-driver project and open **Properties**. <br />
+Go to **Configuration Properties -> Driver Signing -> General**. <br />
+
+Set the driver signing options to:
+
+* **Sign Mode:** Test Sign
+* **Test Certificate:** create a new test certificate
+* **Configuration:** Release
+* **Platform:** x64
+
+Apply the settings and save the project. <br />
+
+## 3. Build both projects
+
+Build the ude-driver project in **Release x64**. <br />
+And build the ude-usermode project in **Release x64**. <br />
+
+## 4. Open the build
+
+Run ```ude-usermode.exe ude-driver.sys``` as Administrator. <br />
+
+## 5. Enable test signing
+
+When UDE opens, press ```Continue```. If test signing is not enabled, you'll be prompted to enable test signing. <br />
+
+## 6. Scan for detections before and after mapping your kernel driver
+Run a scan before mapping your own kernel driver. <br />
+This will tell you if UDE has any false positives before running your driver. <br />
+
+https://github.com/user-attachments/assets/f961544d-8c7e-4de9-b48e-0ffb615ed956
+
+https://github.com/user-attachments/assets/b477a50b-409b-481a-afcd-d28c1b759b6f
+
+<img width="990" height="633" alt="image" src="https://github.com/user-attachments/assets/98063e96-0263-4d22-8c4c-a55f3db53e75" />
