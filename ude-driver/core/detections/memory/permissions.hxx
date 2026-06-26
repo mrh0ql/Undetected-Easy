@@ -230,6 +230,25 @@ namespace memory_scan::permissions {
 		return evidence;
 	}
 
+	bool range_overlaps_loaded_module( const system_modules_t* modules, unsigned long long start, unsigned long long end ) {
+		if ( !modules || !start || end <= start )
+			return false;
+
+		for ( auto index = 0ul; index < modules->m_count; index++ ) {
+			auto module = &modules->m_modules[ index ];
+			auto module_start = reinterpret_cast< unsigned long long >( module->m_image_base );
+			auto module_end = module_start + module->m_image_size;
+
+			if ( !module_start || !module->m_image_size || module_end <= module_start )
+				continue;
+
+			if ( start < module_end && end > module_start )
+				return true;
+		}
+
+		return false;
+	}
+
 	void flush_executable_region( scan_state_t* state ) {
 		if ( !state || !state->m_command || !state->m_executable_region_start ||
 			state->m_executable_region_end <= state->m_executable_region_start ) {
@@ -239,6 +258,18 @@ namespace memory_scan::permissions {
 				state->m_executable_region_pages = 0;
 				state->m_executable_region_has_executable = false;
 			}
+			return;
+		}
+
+		if ( range_overlaps_loaded_module(
+			state->m_modules,
+			state->m_executable_region_start,
+			state->m_executable_region_end
+		) ) {
+			state->m_executable_region_start = 0;
+			state->m_executable_region_end = 0;
+			state->m_executable_region_pages = 0;
+			state->m_executable_region_has_executable = false;
 			return;
 		}
 
@@ -319,7 +350,7 @@ namespace memory_scan::permissions {
 				state->m_executable_region_start,
 				state->m_executable_region_end
 			);
-			if ( evidence.m_private_4kb_pages && evidence.m_executable_pages &&
+			if ( evidence.m_private_4kb_pages > 5 && evidence.m_executable_pages &&
 				evidence.m_max_unwind_run >= m_min_unwind_run &&
 				evidence.m_max_import_run >= m_min_import_run ) {
 				char detail[ ioctl::m_detection_text_size ]{ };
@@ -357,7 +388,11 @@ namespace memory_scan::permissions {
 			return;
 
 		auto candidate = mapping.m_kernel &&
-			!is_module_backed( state->m_modules, mapping.m_va ) &&
+			!range_overlaps_loaded_module(
+				state->m_modules,
+				mapping.m_va,
+				mapping.m_va + mapping.m_page_size
+			) &&
 			!is_device_like_mapping( mapping ) &&
 			is_mapping_inside_physical_ranges( state, mapping );
 		if ( !candidate ) {
@@ -518,50 +553,6 @@ namespace memory_scan::permissions {
 		state->m_permission_detections++;
 	}
 
-	void report_wx_page( scan_state_t* state, const page_mapping_t& mapping ) {
-		if ( !state || !state->m_command || !mapping.m_kernel || !mapping.m_writable || !mapping.m_executable )
-			return;
-
-		if ( is_module_backed( state->m_modules, mapping.m_va ) )
-			return;
-
-		state->m_wx_candidates++;
-
-		// Large executable mappings and device/MMIO mappings are common platform
-		// mappings. The mapper signal we want is a private 4 KiB RAM page that is
-		// writable and executable but has no loaded-image owner.
-		if ( mapping.m_page_size != PAGE_SIZE ||
-			is_device_like_mapping( mapping ) ||
-			!mapping.m_pfn ||
-			!is_mapping_inside_physical_ranges( state, mapping ) ||
-			memory::pool::owns_allocation_address( mapping.m_va ) ) {
-			state->m_wx_suppressed++;
-			return;
-		}
-
-		char detail[ ioctl::m_detection_text_size ]{ };
-		RtlStringCbPrintfA(
-			detail,
-			sizeof( detail ),
-			"va=0x%llx pfn=0x%llx pa=0x%llx size=0x%x rw=1 nx=0 user=%u",
-			mapping.m_va,
-			mapping.m_pfn,
-			mapping.m_pfn << page_shift,
-			mapping.m_page_size,
-			static_cast< unsigned long >( mapping.m_user )
-		);
-
-		report::add_memory_detection(
-			state->m_command,
-			"memory!rwx",
-			report::m_writable_executable_page_violation,
-			detail,
-			mapping.m_va,
-			mapping.m_page_size
-		);
-		state->m_permission_detections++;
-	}
-
 	void report_executable_anonymous_page( scan_state_t* state, const page_mapping_t& mapping ) {
 		if ( !state || !state->m_command || !mapping.m_kernel || !mapping.m_executable )
 			return;
@@ -616,7 +607,6 @@ namespace memory_scan::permissions {
 		report_pfn_outside_ranges( state, mapping );
 		report_physical_address_disagreement( state, mapping );
 		report_kernel_user_page( state, mapping );
-		report_wx_page( state, mapping );
 	}
 }
 
