@@ -3,7 +3,18 @@ Undetected Easy (UDE) is a detection scanner for finding Kernel Driver detection
 UDE was built around reverse-engineered routines primarily from **EasyAntiCheat, BattlEye and Vanguard**. <br />
 UDE gives developers a way around **ban waves** and **before anti-cheats can collect any other signatures**. <br />
 
+# How does UDE work?
+
+UDE is a **usermode interface** and a **kernel detection driver**. <br />
+The usermode client creates a **interactable interface** and communicates with the driver to find detections. <br />
+The **kernel driver handles the detection scanning logic** while the **usermode displays it**. <br />
+
+The driver creates a detection packet containing the **target, violation type, detection method, address, size, and status**. <br />
+The client displays the detections with the **category, reason and how to fix it** after scanning.
+After scanning it writes a raw detection `ude-log.txt` report for review if needed. <br />
+
 # What does UDE detect?
+
 UDE includes multiple scan categories based on common anti-cheat integrity routines. <br />
 It scans **kernel memory, execution flow, loaded modules, objects, devices, and process/thread states**. <br />
 Each scan category has different multiple integrity checks.<br />
@@ -187,15 +198,6 @@ DPCs can be used to **run code without creating a normal long-lived thread**. <b
 Anti-cheats can still inspect queued routines and **validate whether their targets belong to legitimate kernel images**. <br />
 
 </details>
-
-# How does UDE work?
-
-UDE is split into a **usermode interface** and a **kernel detection driver**. <br />
-The usermode client creates a **user-interactable interface** and communicates with the driver to find detections. <br />
-The **kernel driver handles all of the detection scanning** logic while the **usermode displays it**. <br />
-
-When the driver finds something suspicious, it **records a structured detection** containing the **target, violation type, detection method, address, size, and status**. <br />
-The client pulls the reports back from the driver, **filters known false positives**, displays the results in the dashboard, and writes a raw detection `ude-log.txt` report for review. <br />
 
 # Tutorial
 
