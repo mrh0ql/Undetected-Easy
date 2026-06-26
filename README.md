@@ -10,7 +10,7 @@ The usermode client creates a **interface** and **communicates** with the driver
 The **kernel driver handles the detection scanning logic** while the **usermode displays it**. <br />
 
 The driver creates a detection packet containing the **target, violation type, detection method, address, size, and status**. <br />
-The client displays the detections with the **category, reason and how to fix it** after scanning.
+The client displays the detections with the **category, reason and how to fix it** after scanning. <br />
 After scanning it writes a raw detection `ude-log.txt` report for review if needed. <br />
 
 # What does UDE detect?
