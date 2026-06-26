@@ -13,6 +13,12 @@ The driver creates a detection packet containing the **target, violation, method
 The client displays the detections with the **category, reason and how to fix it** after scanning. <br />
 After scanning it writes a raw detection `ude-log.txt` report for review if needed. <br />
 
+# Why use UDE?
+
+Anti-cheats detect projects through **many small integrity checks** instead of one universal method. <br />
+UDE helps show which part of your project is detected, why it is detected, and **how you can remove it**. <br />
+This makes it **easier to fix detection sources** before testing against a real anti-cheat. <br />
+
 # What does UDE detect?
 
 UDE includes multiple scan categories based on common anti-cheat integrity routines. <br />
@@ -202,7 +208,3 @@ Anti-cheats can still inspect queued routines and **validate whether their targe
 # Tutorial
 
 
-# Why use UDE?
-Anti-cheats detect projects through **many small integrity checks** instead of one universal method. <br />
-UDE helps show which part of your project is detected, why it is detected, and **how you can remove it**. <br />
-This makes it **easier to fix detection sources** before testing against a real anti-cheat. <br />
