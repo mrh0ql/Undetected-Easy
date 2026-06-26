@@ -8,20 +8,7 @@ UDE gives developers a way around **ban waves** and **before anti-cheats can col
   <ol>
     <li><a href="#how-does-ude-work">How does UDE work?</a></li>
     <li><a href="#why-use-ude">Why use UDE?</a></li>
-    <li>
-      <a href="#what-does-ude-detect">What does UDE detect?</a>
-      <ul>
-        <li><a href="#module-integrity">Module Integrity</a></li>
-        <li><a href="#execution-integrity">Execution Integrity</a></li>
-        <li><a href="#memory-integrity">Memory Integrity</a></li>
-        <li><a href="#pool-integrity">Pool Integrity</a></li>
-        <li><a href="#process-integrity">Process Integrity</a></li>
-        <li><a href="#object-integrity">Object Integrity</a></li>
-        <li><a href="#service-integrity">Service Integrity</a></li>
-        <li><a href="#cpu-integrity">CPU Integrity</a></li>
-        <li><a href="#dpc-integrity">DPC Integrity</a></li>
-      </ul>
-    </li>
+    <li><a href="#what-does-ude-detect">What does UDE detect?</a></li>
     <li><a href="#tutorial">Tutorial</a></li>
     <li><a href="#roadmap">Roadmap</a></li>
     <li><a href="#conclusion">Conclusion</a></li>
