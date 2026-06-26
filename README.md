@@ -256,7 +256,7 @@ https://github.com/user-attachments/assets/f961544d-8c7e-4de9-b48e-0ffb615ed956
 
 https://github.com/user-attachments/assets/b477a50b-409b-481a-afcd-d28c1b759b6f
 
-<img width="948" height="582" alt="gfdgdfgdgfdgf" src="https://github.com/user-attachments/assets/247ca570-31ab-4f53-a097-644e32a744a5" />
+<img width="990" height="633" alt="image" src="https://github.com/user-attachments/assets/82bc368d-74dc-478b-ad42-e5f37ddddba2" />
 
 ## Roadmap
 - [x] Add Changelog
