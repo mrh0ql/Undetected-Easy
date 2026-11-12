@@ -146,22 +146,195 @@ namespace cpu_integrity {
 		return detections;
 	}
 
+	unsigned long scan_all_processors( ioctl::command_t* command, const system_modules_t* modules, unsigned long* total_idt_entries ) {
+		if ( total_idt_entries )
+			*total_idt_entries = 0;
+
+		if ( !command || !modules )
+			return 0;
+
+		auto processor_count = KeQueryActiveProcessorCountEx( ALL_PROCESSOR_GROUPS );
+		if ( !processor_count )
+			processor_count = 1;
+
+		unsigned long detections = 0;
+		for ( auto proc_index = 0ul; proc_index < processor_count; proc_index++ ) {
+			PROCESSOR_NUMBER proc_num{ };
+			if ( NT_SUCCESS( KeGetProcessorNumberFromIndex( proc_index, &proc_num ) ) ) {
+				GROUP_AFFINITY affinity{ };
+				GROUP_AFFINITY previous_affinity{ };
+				affinity.Group = proc_num.Group;
+				affinity.Mask = 1ull << proc_num.Number;
+				KeSetSystemGroupAffinityThread( &affinity, &previous_affinity );
+
+				command->m_sections_scanned = 0;
+				detections += scan_idt( command, modules );
+				if ( total_idt_entries )
+					*total_idt_entries += command->m_sections_scanned;
+				detections += scan_msrs( command, modules );
+
+				KeRevertToUserGroupAffinityThread( &previous_affinity );
+			}
+			else if ( proc_index == 0 ) {
+				command->m_sections_scanned = 0;
+				detections += scan_idt( command, modules );
+				if ( total_idt_entries )
+					*total_idt_entries += command->m_sections_scanned;
+				detections += scan_msrs( command, modules );
+			}
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_patchguard_and_debugger_state( ioctl::command_t* command, const system_modules_t* modules ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		size_t copied = 0;
+
+		unsigned char kd_not_present = 1;
+		unsigned char kd_pitch = 1;
+		bool read_not_present = false;
+		bool read_pitch = false;
+
+		if ( m_entry.m_pdb.m_kd_debugger_not_present &&
+			memory::is_canonical_kernel_address( m_entry.m_pdb.m_kd_debugger_not_present ) ) {
+			read_not_present = memory::copy_kernel_memory(
+				reinterpret_cast< void* >( m_entry.m_pdb.m_kd_debugger_not_present ),
+				sizeof( kd_not_present ),
+				&kd_not_present,
+				&copied
+			);
+		}
+
+		if ( m_entry.m_pdb.m_kd_pitch_debugger &&
+			memory::is_canonical_kernel_address( m_entry.m_pdb.m_kd_pitch_debugger ) ) {
+			read_pitch = memory::copy_kernel_memory(
+				reinterpret_cast< void* >( m_entry.m_pdb.m_kd_pitch_debugger ),
+				sizeof( kd_pitch ),
+				&kd_pitch,
+				&copied
+			);
+		}
+
+		const auto shared_kd_enabled = SharedUserData->KdDebuggerEnabled;
+		if ( read_not_present && read_pitch ) {
+			const auto state_contradiction =
+				( shared_kd_enabled && kd_not_present != 0 && kd_pitch != 0 ) ||
+				( !shared_kd_enabled && kd_not_present == 0 && kd_pitch != 0 );
+
+			if ( state_contradiction ) {
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"shared_kd=%u kd_not_present=%u kd_pitch=%u reason=kd_patchguard_bypass_spoof",
+					static_cast< unsigned long >( shared_kd_enabled ),
+					static_cast< unsigned long >( kd_not_present ),
+					static_cast< unsigned long >( kd_pitch )
+				);
+				report::add_memory_detection(
+					command,
+					"patchguard!kd_state",
+					report::m_patchguard_context_violation,
+					detail,
+					m_entry.m_pdb.m_kd_debugger_not_present,
+					sizeof( unsigned char )
+				);
+				detections++;
+			}
+		}
+
+		if ( m_entry.m_pdb.m_ki_wait_never && m_entry.m_pdb.m_ki_wait_always ) {
+			unsigned long long wait_never = 0;
+			unsigned long long wait_always = 0;
+			if ( memory::copy_kernel_memory( reinterpret_cast< void* >( m_entry.m_pdb.m_ki_wait_never ), sizeof( wait_never ), &wait_never, &copied ) &&
+				memory::copy_kernel_memory( reinterpret_cast< void* >( m_entry.m_pdb.m_ki_wait_always ), sizeof( wait_always ), &wait_always, &copied ) ) {
+				if ( wait_never == 0 || wait_always == 0 ) {
+					char detail[ ioctl::m_detection_text_size ]{ };
+					RtlStringCbPrintfA(
+						detail,
+						sizeof( detail ),
+						"KiWaitNever=0x%llx KiWaitAlways=0x%llx reason=timer_obfuscation_keys_zeroed",
+						wait_never,
+						wait_always
+					);
+					report::add_memory_detection(
+						command,
+						"patchguard!timer_keys",
+						report::m_patchguard_context_violation,
+						detail,
+						m_entry.m_pdb.m_ki_wait_never,
+						sizeof( unsigned long long )
+					);
+					detections++;
+				}
+			}
+		}
+
+		auto nt_module = module::disk::find_module_by_file_name( modules, "ntoskrnl.exe" );
+		if ( nt_module ) {
+			UNICODE_STRING bugcheck_name = RTL_CONSTANT_STRING( L"KeBugCheckEx" );
+			auto bugcheck_addr = reinterpret_cast< unsigned long long >( MmGetSystemRoutineAddress( &bugcheck_name ) );
+			if ( bugcheck_addr && memory::is_canonical_kernel_address( bugcheck_addr ) ) {
+				unsigned char prologue[ 16 ]{ };
+				if ( memory::copy_kernel_memory( reinterpret_cast< void* >( bugcheck_addr ), sizeof( prologue ), prologue, &copied ) ) {
+					const auto patched_ret_or_jmp =
+						prologue[ 0 ] == 0xC3 ||
+						prologue[ 0 ] == 0xE9 ||
+						prologue[ 0 ] == 0xEB ||
+						( prologue[ 0 ] == 0xFF && prologue[ 1 ] == 0x25 ) ||
+						( prologue[ 0 ] == 0x48 && prologue[ 1 ] == 0x31 && prologue[ 2 ] == 0xC0 && prologue[ 3 ] == 0xC3 );
+
+					if ( patched_ret_or_jmp ) {
+						char detail[ ioctl::m_detection_text_size ]{ };
+						RtlStringCbPrintfA(
+							detail,
+							sizeof( detail ),
+							"KeBugCheckEx=0x%llx bytes=%02x_%02x_%02x_%02x reason=patchguard_bugcheck_hooked",
+							bugcheck_addr,
+							prologue[ 0 ],
+							prologue[ 1 ],
+							prologue[ 2 ],
+							prologue[ 3 ]
+						);
+						report::add_memory_detection(
+							command,
+							"patchguard!KeBugCheckEx",
+							report::m_patchguard_context_violation,
+							detail,
+							bugcheck_addr,
+							sizeof( prologue )
+						);
+						detections++;
+					}
+				}
+			}
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
 
-		auto idt_detections = scan_idt( command, modules );
-		auto msr_detections = scan_msrs( command, modules );
+		unsigned long total_idt_entries = 0;
+		auto cpu_detections = scan_all_processors( command, modules, &total_idt_entries );
+		auto pg_detections = scan_patchguard_and_debugger_state( command, modules );
+		command->m_sections_scanned = total_idt_entries;
 		command->m_modules_scanned = modules->m_count;
-		command->m_signature_detections = idt_detections + msr_detections;
+		command->m_signature_detections = cpu_detections + pg_detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 
 		utility::print(
-			"cpu integrity: idt_entries=%lu idt_detections=%lu msr_detections=%lu detections=%lu\n",
+			"cpu & patchguard integrity: idt_entries=%lu cpu_detections=%lu pg_detections=%lu detections=%lu\n",
 			command->m_sections_scanned,
-			idt_detections,
-			msr_detections,
+			cpu_detections,
+			pg_detections,
 			command->m_total_detection_count
 		);
 		return true;

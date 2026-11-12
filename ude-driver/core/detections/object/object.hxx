@@ -315,19 +315,27 @@ namespace object_integrity {
 			return false;
 
 		unsigned long named_sections = 0;
-		const auto detections = scan_named_sections(
+		unsigned long symbolic_links = 0;
+		PDRIVER_OBJECT scanned_drivers[ 512 ]{ };
+		unsigned long scanned_driver_count = 0;
+
+		auto detections = scan_named_sections(
 			command, L"\\BaseNamedObjects", "global", &named_sections
+		);
+		detections += scan_public_device_links(
+			command, modules, scanned_drivers, &scanned_driver_count, &symbolic_links
 		);
 
 		command->m_modules_scanned = modules->m_count;
-		command->m_sections_scanned = named_sections;
-		command->m_signature_candidates = named_sections;
+		command->m_sections_scanned = named_sections + symbolic_links;
+		command->m_signature_candidates = named_sections + symbolic_links;
 		command->m_signature_detections = detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 		utility::print(
-			"object integrity: named sections=%lu detections=%lu\n",
+			"object integrity: named sections=%lu links=%lu detections=%lu\n",
 			named_sections,
+			symbolic_links,
 			command->m_total_detection_count
 		);
 		return true;

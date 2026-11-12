@@ -35,6 +35,7 @@
 #include <core/detections/execution/thread.hxx>
 #include <core/detections/execution/processor.hxx>
 
+#include <core/detections/callback/callback.hxx>
 #include <core/detections/device/helpers.hxx>
 #include <core/detections/device/device.hxx>
 
@@ -43,5 +44,4 @@
 #include <core/detections/object/object.hxx>
 #include <core/detections/dpc/dpc.hxx>
 #include <core/detections/pool/pool.hxx>
-#include <core/detections/callback/callback.hxx>
 #include <core/ioctl/ioctl.hxx>

@@ -126,12 +126,169 @@ namespace callback {
 	}
 
 	inline bool blocklist_matches_name( const blocklist_entry_t& entry, const char* name ) {
-		if ( entry.m_kind != blocklist_rule_kind::direct_deny || !entry.m_file_name[ 0 ] )
+		if ( !name || !name[ 0 ] )
 			return false;
-		if ( !equal_ascii_insensitive( entry.m_minimum_file_version, "0.0.0.0" ) ||
-			!equal_ascii_insensitive( entry.m_maximum_file_version, "65535.65535.65535.65535" ) )
+
+		if ( entry.m_kind != blocklist_rule_kind::direct_deny &&
+			entry.m_kind != blocklist_rule_kind::denied_signer_file_attribute )
 			return false;
-		return equal_ascii_insensitive( entry.m_file_name, name );
+
+		if ( entry.m_file_name[ 0 ] && !equal_ascii_insensitive( entry.m_file_name, "*" ) &&
+			equal_ascii_insensitive( entry.m_file_name, name ) )
+			return true;
+
+		if ( entry.m_internal_name[ 0 ] && !equal_ascii_insensitive( entry.m_internal_name, "*" ) &&
+			equal_ascii_insensitive( entry.m_internal_name, name ) )
+			return true;
+
+		return false;
+	}
+
+	inline void format_sha1_hex( const sha1_digest_t& digest, char* output, size_t output_size ) {
+		if ( !output || output_size < 41 )
+			return;
+
+		constexpr const char* hex_digits = "0123456789abcdef";
+		for ( auto i = 0u; i < 20u; i++ ) {
+			output[ i * 2 ] = hex_digits[ ( digest.m_bytes[ i ] >> 4 ) & 0x0f ];
+			output[ i * 2 + 1 ] = hex_digits[ digest.m_bytes[ i ] & 0x0f ];
+		}
+		output[ 40 ] = '\0';
+	}
+
+	inline bool blocklist_matches_sha1( const blocklist_entry_t& entry, const char* sha1_hex ) {
+		if ( entry.m_kind != blocklist_rule_kind::direct_deny || !entry.m_hash[ 0 ] || !sha1_hex || !sha1_hex[ 0 ] )
+			return false;
+
+		return equal_ascii_insensitive( entry.m_hash, sha1_hex );
+	}
+
+	inline bool is_driver_name_blocked( const char* name, char* matched_rule_detail, size_t detail_size ) {
+		if ( matched_rule_detail && detail_size )
+			matched_rule_detail[ 0 ] = '\0';
+
+		if ( !name || !name[ 0 ] )
+			return false;
+
+		bool matched = false;
+		KeEnterCriticalRegion( );
+		ExAcquirePushLockShared( &m_blocklist_lock );
+		for ( auto index = 0ul; index < m_vulnerable_driver_blocklist_count; index++ ) {
+			const auto& entry = m_vulnerable_driver_blocklist[ index ];
+			if ( blocklist_matches_name( entry, name ) ) {
+				matched = true;
+				if ( matched_rule_detail && detail_size ) {
+					RtlStringCbPrintfA(
+						matched_rule_detail,
+						detail_size,
+						"rule=%s file=%s min_ver=%s max_ver=%s",
+						entry.m_friendly_name[ 0 ] ? entry.m_friendly_name : "BlocklistRule",
+						entry.m_file_name[ 0 ] ? entry.m_file_name : entry.m_internal_name,
+						entry.m_minimum_file_version[ 0 ] ? entry.m_minimum_file_version : "any",
+						entry.m_maximum_file_version[ 0 ] ? entry.m_maximum_file_version : "any"
+					);
+				}
+				break;
+			}
+		}
+		ExReleasePushLockShared( &m_blocklist_lock );
+		KeLeaveCriticalRegion( );
+		return matched;
+	}
+
+	inline bool is_driver_sha1_blocked( const char* sha1_hex, char* matched_rule_detail, size_t detail_size ) {
+		if ( matched_rule_detail && detail_size )
+			matched_rule_detail[ 0 ] = '\0';
+
+		if ( !sha1_hex || !sha1_hex[ 0 ] )
+			return false;
+
+		bool matched = false;
+		KeEnterCriticalRegion( );
+		ExAcquirePushLockShared( &m_blocklist_lock );
+		for ( auto index = 0ul; index < m_vulnerable_driver_blocklist_count; index++ ) {
+			const auto& entry = m_vulnerable_driver_blocklist[ index ];
+			if ( blocklist_matches_sha1( entry, sha1_hex ) ) {
+				matched = true;
+				if ( matched_rule_detail && detail_size ) {
+					RtlStringCbPrintfA(
+						matched_rule_detail,
+						detail_size,
+						"rule=%s sha1=%s",
+						entry.m_friendly_name[ 0 ] ? entry.m_friendly_name : "BlocklistHashRule",
+						entry.m_hash
+					);
+				}
+				break;
+			}
+		}
+		ExReleasePushLockShared( &m_blocklist_lock );
+		KeLeaveCriticalRegion( );
+		return matched;
+	}
+
+	inline unsigned long scan_loaded_modules( ioctl::command_t* command, const system_modules_t* modules ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto module_index = 0ul; module_index < modules->m_count; module_index++ ) {
+			const auto& mod = modules->m_modules[ module_index ];
+			if ( mod.m_offset_to_file_name >= sizeof( mod.m_full_path_name ) )
+				continue;
+
+			const auto name = reinterpret_cast< const char* >( mod.m_full_path_name ) + mod.m_offset_to_file_name;
+			if ( !name || !name[ 0 ] || module::disk::is_whitelisted_owner( name ) )
+				continue;
+
+			char rule_detail[ 160 ]{ };
+			bool matched = is_driver_name_blocked( name, rule_detail, sizeof( rule_detail ) );
+
+			if ( !matched ) {
+				void* disk_image = nullptr;
+				unsigned long disk_size = 0;
+				if ( NT_SUCCESS( module::disk::read_module_image_from_disk( mod, &disk_image, &disk_size ) ) && disk_image && disk_size ) {
+					auto digest = c_sha1::hash_buffer( disk_image, disk_size );
+					memory::free_pool( disk_image );
+
+					char sha1_hex[ 41 ]{ };
+					format_sha1_hex( digest, sha1_hex, sizeof( sha1_hex ) );
+					matched = is_driver_sha1_blocked( sha1_hex, rule_detail, sizeof( rule_detail ) );
+				}
+			}
+
+			if ( matched ) {
+				KeEnterCriticalRegion( );
+				ExAcquirePushLockExclusive( &m_blocklist_lock );
+				record_blocked_driver_locked( name );
+				ExReleasePushLockExclusive( &m_blocklist_lock );
+				KeLeaveCriticalRegion( );
+
+				char target[ ioctl::m_detection_target_size ]{ };
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA( target, sizeof( target ), "blocklist!%s", name );
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"driver=%s base=0x%llx size=0x%lx %s",
+					name,
+					reinterpret_cast< unsigned long long >( mod.m_image_base ),
+					mod.m_image_size,
+					rule_detail
+				);
+				report::add_memory_detection(
+					command,
+					target,
+					report::m_vulnerable_driver_blocklist_violation,
+					detail,
+					reinterpret_cast< unsigned long long >( mod.m_image_base ),
+					mod.m_image_size ? mod.m_image_size : PAGE_SIZE
+				);
+				detections++;
+			}
+		}
+
+		return detections;
 	}
 
 	inline void image_load_notify(
@@ -148,9 +305,10 @@ namespace callback {
 		ExAcquirePushLockExclusive( &m_blocklist_lock );
 		for ( auto index = 0ul; index < m_vulnerable_driver_blocklist_count; index++ ) {
 			const auto& entry = m_vulnerable_driver_blocklist[ index ];
-			if ( entry.m_kind == blocklist_rule_kind::direct_deny &&
-				equal_ascii_insensitive( entry.m_minimum_file_version, "0.0.0.0" ) &&
-				equal_ascii_insensitive( entry.m_maximum_file_version, "65535.65535.65535.65535" ) &&
+			if ( ( entry.m_kind == blocklist_rule_kind::direct_deny ||
+				entry.m_kind == blocklist_rule_kind::denied_signer_file_attribute ) &&
+				entry.m_file_name[ 0 ] &&
+				!equal_ascii_insensitive( entry.m_file_name, "*" ) &&
 				equal_image_name( full_image_name, entry.m_file_name ) ) {
 				const auto name = entry.m_file_name;
 				record_blocked_driver_locked( name );
@@ -166,23 +324,38 @@ namespace callback {
 		if ( !memory::query_system_modules( &modules ) || !modules )
 			return STATUS_UNSUCCESSFUL;
 
-		KeEnterCriticalRegion( );
-		ExAcquirePushLockExclusive( &m_blocklist_lock );
 		for ( auto module_index = 0ul; module_index < modules->m_count; module_index++ ) {
-			const auto& module = modules->m_modules[ module_index ];
-			if ( module.m_offset_to_file_name >= sizeof( module.m_full_path_name ) )
+			const auto& mod = modules->m_modules[ module_index ];
+			if ( mod.m_offset_to_file_name >= sizeof( mod.m_full_path_name ) )
 				continue;
-			const auto name = reinterpret_cast< const char* >( module.m_full_path_name ) +
-				module.m_offset_to_file_name;
-			for ( auto rule_index = 0ul; rule_index < m_vulnerable_driver_blocklist_count; rule_index++ ) {
-				if ( blocklist_matches_name( m_vulnerable_driver_blocklist[ rule_index ], name ) ) {
-					record_blocked_driver_locked( name );
-					break;
+			const auto name = reinterpret_cast< const char* >( mod.m_full_path_name ) +
+				mod.m_offset_to_file_name;
+			if ( !name || !name[ 0 ] || module::disk::is_whitelisted_owner( name ) )
+				continue;
+
+			char rule_detail[ 128 ]{ };
+			bool matched = is_driver_name_blocked( name, rule_detail, sizeof( rule_detail ) );
+			if ( !matched ) {
+				void* disk_image = nullptr;
+				unsigned long disk_size = 0;
+				if ( NT_SUCCESS( module::disk::read_module_image_from_disk( mod, &disk_image, &disk_size ) ) && disk_image && disk_size ) {
+					auto digest = c_sha1::hash_buffer( disk_image, disk_size );
+					memory::free_pool( disk_image );
+
+					char sha1_hex[ 41 ]{ };
+					format_sha1_hex( digest, sha1_hex, sizeof( sha1_hex ) );
+					matched = is_driver_sha1_blocked( sha1_hex, rule_detail, sizeof( rule_detail ) );
 				}
 			}
+
+			if ( matched ) {
+				KeEnterCriticalRegion( );
+				ExAcquirePushLockExclusive( &m_blocklist_lock );
+				record_blocked_driver_locked( name );
+				ExReleasePushLockExclusive( &m_blocklist_lock );
+				KeLeaveCriticalRegion( );
+			}
 		}
-		ExReleasePushLockExclusive( &m_blocklist_lock );
-		KeLeaveCriticalRegion( );
 		memory::free_pool( modules );
 		return STATUS_SUCCESS;
 	}

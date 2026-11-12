@@ -149,9 +149,12 @@ If a process, thread, or address space exists in kernel structures but is hidden
 
 # What It Detects
 * World-writable named sections
+* Public `\GLOBAL??` symbolic links targeting unbacked or anomalous devices
 * Suspicious device object chains
 * Devices owned by hidden or unloaded drivers
 * Driver objects that do not match loaded modules
+* Vulnerable drivers matching Microsoft's Vulnerable Driver Blocklist (by filename, attribute, or SHA1 image digest)
+* `PiDDBCacheTable` and `MmUnloadedDrivers` history traces, wiped entries, or broken links
 * Broad or memory-control-shaped IOCTL dispatch surfaces
 * Dispatch routines outside the owning module
 * Dispatch routines pointing to unknown memory
@@ -160,23 +163,24 @@ If a process, thread, or address space exists in kernel structures but is hidden
 
 # Why It Matters
 A kernel driver usually **needs some way to communicate** with usermode. <br />
-Anti-cheats scan to find drivers that **expose suspicious controls** or **point their handlers into hidden code**. <br />
+Anti-cheats scan to find drivers that **expose suspicious controls**, **leave vulnerable driver traces in `PiDDBCacheTable` / `MmUnloadedDrivers`**, or **point their handlers into hidden code**. <br />
 
 </details>
 
 <details>
   <summary><b>Service Integrity</b></summary>
 
-  Service integrity validates important kernel service pointers and service-table state. <br />
+  Service integrity validates important kernel service pointers, `HalDispatchTable` / `HalPrivateDispatchTable` routines, and service-table state. <br />
   
 # What It Detects
 * Service routine targets outside trusted kernel code
+* `HalDispatchTable` and `HalPrivateDispatchTable` function pointers redirected outside system modules
 * Modified service table entries
 * Kernel service pointers redirected into unknown memory
 * Service routines backed by suspicious executable regions
 
 # Why It Matters
-Service-table modification is a **classic kernel hook** technique. <br />
+Service-table and HAL dispatch table modification is a **classic kernel hook** technique. <br />
 Even if the hook target works correctly, the **pointer itself can reveal that execution has been redirected away** from the expected kernel image. <br />
 
 </details>
@@ -184,36 +188,37 @@ Even if the hook target works correctly, the **pointer itself can reveal that ex
 <details>
   <summary><b>CPU Integrity</b></summary>
 
-  CPU integrity checks processor-level control structures and privileged execution targets. <br />
+  CPU integrity checks processor-level control structures across all logical cores, privileged execution targets, and PatchGuard / kernel debugger state. <br />
 
 # What It Detects
-* IDT handlers outside trusted code
-* Processor MSR targets outside trusted code
-* Syscall MSR targets outside kernel code
+* Per-processor IDT handlers outside trusted code across all logical cores
+* Processor MSR targets (`IA32_LSTAR`, `IA32_CSTAR`, `IA32_SYSENTER_EIP`) outside trusted code
+* PatchGuard and kernel debugger state tampering (`KdDebuggerNotPresent`, `KdPitchDebugger`, `SharedUserData->KdDebuggerEnabled`, `KeBugCheckEx` hooks, and `KiWaitNever` / `KiWaitAlways` timer keys)
 * CPU-controlled handlers redirected into unknown memory
 * Processor entry points backed by suspicious PFNs
 
 # Why It Matters
-Some kernel projects **avoid normal hooks and instead modify hardware** structures. <br />
-Anti-cheats can validate these targets directly because interrupt handlers, syscall entry points, and model-specific register targets have strict expectations. <br />
+Some kernel projects **avoid normal hooks and instead modify hardware** structures or disable PatchGuard. <br />
+Anti-cheats can validate these targets directly across every logical processor because interrupt handlers, syscall entry points, model-specific register targets, and PatchGuard state invariants have strict expectations. <br />
 
 </details>
 
 <details>
   <summary><b>DPC Integrity</b></summary>
 
-  DPC integrity scans Deferred Procedure Call objects and their execution targets. <br />
+  DPC integrity scans Deferred Procedure Call objects, `KTIMER` encoded DPC routines, and their execution targets. <br />
   
 # What It Detects
 * DPC targets outside trusted code
+* Obfuscated `KTIMER` DPC routines (`KiWaitNever` / `KiWaitAlways` decoded) pointing outside trusted modules
 * DPC routines pointing into unknown memory
 * DPC routines backed by suspicious PFNs
 * Suspicious DPC object flags
 * Deferred execution from memory that does not belong to a loaded module
 
 # Why It Matters
-DPCs can be used to **run code without creating a normal long-lived thread**. <br />
-Anti-cheats can still inspect queued routines and **validate whether their targets belong to legitimate kernel images**. <br />
+DPCs and periodic kernel timers can be used to **run code without creating a normal long-lived thread**. <br />
+Anti-cheats can still inspect queued routines and decode `KTIMER` DPC pointers to **validate whether their targets belong to legitimate kernel images**. <br />
 
 </details>
 
@@ -261,8 +266,10 @@ https://github.com/user-attachments/assets/b477a50b-409b-481a-afcd-d28c1b759b6f
 ## Roadmap
 - [x] Add Changelog
 - [x] Finish Detection Categories
-- [ ] Add Vulernable Driver Blocklist Check
-- [ ] Add PatchGuard Context Check
+- [x] Add Vulnerable Driver Blocklist Check
+- [x] Add PatchGuard Context Check
+- [x] Add `PiDDBCacheTable` & `MmUnloadedDrivers` Forensics
+- [x] Add `HalDispatchTable` & `HalPrivateDispatchTable` Integrity Check
 
 ## Conclusion
 Undetected Easy is a **kernel detection scanner** made to find **driver detections before anti-cheats do**. <br />

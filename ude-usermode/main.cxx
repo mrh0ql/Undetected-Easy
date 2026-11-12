@@ -116,14 +116,26 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "loaded module list entry" ) )
 		return obf( "we detected a loaded-module entry that does not line up with a normal driver image/object; load the driver through the normal service path." );
 
+	if ( contains_insensitive( type, "blocklist" ) || contains_insensitive( type, "vulnerable driver" ) )
+		return obf( "we detected a vulnerable driver on Microsoft's blocklist; unload it and clear its traces from PiDDBCacheTable and MmUnloadedDrivers." );
+
+	if ( contains_insensitive( type, "piddbcachetable" ) || contains_insensitive( type, "mmunloadeddrivers" ) )
+		return obf( "we detected driver load history traces or malformed entries in PiDDBCacheTable / MmUnloadedDrivers; sanitize the entry while preserving valid list links and timestamps." );
+
+	if ( contains_insensitive( type, "hal dispatch" ) )
+		return obf( "we detected a modified HalDispatchTable or HalPrivateDispatchTable pointer; restore all HAL dispatch pointers to trusted system modules." );
+
+	if ( contains_insensitive( type, "patchguard" ) || contains_insensitive( type, "kernel debug" ) )
+		return obf( "we detected PatchGuard or kernel debugger state tampering (KdDebuggerNotPresent / KeBugCheckEx / timer keys); restore unmodified kernel state." );
+
 	if ( contains_insensitive( type, "dispatch" ) || contains_insensitive( type, "device object" ) || contains_insensitive( type, "driver object" ) )
 		return obf( "we detected modified driver/device objects; keep dispatch pointers inside the owning driver's executable sections." );
 
 	if ( contains_insensitive( type, "syscall" ) || contains_insensitive( type, "service routine" ) || contains_insensitive( type, "idt handler" ) || contains_insensitive( type, "processor msr" ) )
 		return obf( "we detected modified service tables; keep the service pointers inside of ntoskrnl's executable sections." );
 
-	if ( contains_insensitive( type, "dpc" ) )
-		return obf( "we detected dpc running outside of trusted code; avoid launching routines from untrusted code." );
+	if ( contains_insensitive( type, "dpc" ) || contains_insensitive( type, "timer" ) )
+		return obf( "we detected a DPC or KTIMER routine pointing outside trusted code; avoid queuing DPCs or periodic timers into unbacked memory." );
 
 	if ( contains_insensitive( type, "pool" ) )
 		return obf( "we detected allocated pools; avoid allocating executable pools." );

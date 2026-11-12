@@ -3,6 +3,7 @@
 void driver_unload( PDRIVER_OBJECT driver_object ) {
 	ioctl::destroy( );
 	module::protection::free_kernel_image_snapshot( );
+	paging::remap::destroy( );
 	memory::pool::cleanup( );
 	utility::print( "unloaded ioctl\n" );
 }
@@ -28,6 +29,7 @@ NTSTATUS entry_point( PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_pat
 
 	driver_object->DriverUnload = driver_unload;
 	if ( !ioctl::initialize( driver_object ) ) {
+		paging::remap::destroy( );
 		memory::pool::cleanup( );
 		return STATUS_ACCESS_DENIED;
 	}

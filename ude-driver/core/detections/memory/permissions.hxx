@@ -681,5 +681,30 @@ namespace memory_scan::aliases {
 			if ( !record->m_first_rx_va )
 				record->m_first_rx_va = mapping.m_va;
 		}
+
+		if ( record->m_user && record->m_kernel && !record->m_reported_user_kernel &&
+			record->m_first_user_va != record->m_first_kernel_va &&
+			record->m_first_kernel_va != 0xfffff78000000000ull ) {
+			record->m_reported_user_kernel = true;
+			report_alias(
+				state,
+				report::m_pfn_user_kernel_alias_violation,
+				record->m_first_user_va,
+				record->m_first_kernel_va,
+				record->m_pfn
+			);
+		}
+
+		if ( record->m_rw && record->m_rx && !record->m_reported_rw_rx &&
+			record->m_first_rw_va != record->m_first_rx_va ) {
+			record->m_reported_rw_rx = true;
+			report_alias(
+				state,
+				report::m_pfn_rw_rx_alias_violation,
+				record->m_first_rw_va,
+				record->m_first_rx_va,
+				record->m_pfn
+			);
+		}
 	}
 }

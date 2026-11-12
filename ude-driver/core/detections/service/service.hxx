@@ -209,6 +209,82 @@ namespace service_integrity::routines {
 	}
 }
 
+namespace service_integrity::hal {
+	unsigned long scan_table(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long table_address,
+		const char* table_name,
+		unsigned long pointer_count ) {
+		if ( !command || !modules || !table_address || !memory::is_canonical_kernel_address( table_address ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto index = 1ul; index < pointer_count; index++ ) {
+			auto slot_address = table_address + index * sizeof( unsigned long long );
+			unsigned long long routine = 0;
+			size_t copied = 0;
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( slot_address ), sizeof( routine ), &routine, &copied ) || !routine )
+				continue;
+
+			if ( !memory::is_canonical_kernel_address( routine ) )
+				continue;
+
+			command->m_signature_candidates++;
+
+			target_info_t info{ };
+			query_target_info( modules, routine, &info );
+
+			auto valid_owner = info.m_module && info.m_owner && info.m_executable && !info.m_bad_backing &&
+				( device_surface::is_system_module_path( info.m_module ) ||
+					module::disk::is_whitelisted_owner( info.m_owner ) );
+			if ( valid_owner )
+				continue;
+
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "%s[%lu]", table_name ? table_name : "HalDispatchTable", index );
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"slot=%lu slot_va=0x%llx target=0x%llx owner=%s section=%s pfn=0x%llx",
+				index,
+				slot_address,
+				routine,
+				info.m_owner ? info.m_owner : "unknown",
+				info.m_section[ 0 ] ? info.m_section : "unknown",
+				info.m_pfn
+			);
+
+			report::add_memory_detection(
+				command,
+				target,
+				report::m_hal_dispatch_target_violation,
+				detail,
+				routine,
+				sizeof( void* )
+			);
+			detections++;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		auto hal_dispatch = m_entry.m_pdb.m_hal_dispatch_table;
+		if ( !hal_dispatch && HalDispatchTable )
+			hal_dispatch = reinterpret_cast< unsigned long long >( HalDispatchTable );
+
+		detections += scan_table( command, modules, hal_dispatch, "HalDispatchTable", 22 );
+		detections += scan_table( command, modules, m_entry.m_pdb.m_hal_private_dispatch_table, "HalPrivateDispatchTable", 48 );
+		return detections;
+	}
+}
+
 namespace service_integrity {
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
@@ -229,6 +305,7 @@ namespace service_integrity {
 		}
 
 		auto msr_detections = msr::scan( command, modules );
+		auto hal_detections = hal::scan( command, modules );
 		auto routine_detections = routines::scan_nt_exports(
 			command,
 			modules,
@@ -238,18 +315,19 @@ namespace service_integrity {
 		);
 
 		utility::print(
-			"service integrity: modules=%lu service_exports=%lu msr_detections=%lu routine_detections=%lu detections=%lu\n",
+			"service integrity: modules=%lu service_exports=%lu msr_detections=%lu hal_detections=%lu routine_detections=%lu detections=%lu\n",
 			modules->m_count,
 			command->m_signature_candidates,
 			msr_detections,
+			hal_detections,
 			routine_detections,
 			command->m_total_detection_count
 		);
 
 		memory::free_pool( disk_image );
 		command->m_modules_scanned = modules->m_count;
-		command->m_sections_scanned = 1;
-		command->m_signature_detections = msr_detections + routine_detections;
+		command->m_sections_scanned = 3;
+		command->m_signature_detections = msr_detections + hal_detections + routine_detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 		return true;

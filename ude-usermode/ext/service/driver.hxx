@@ -10,6 +10,16 @@ namespace service {
 			std::uint64_t m_mi_is_page_on_bad_list;
 			std::uint64_t m_mi_make_page_bad;
 			std::uint64_t m_ps_loaded_module_list;
+			std::uint64_t m_pi_ddb_cache_table;
+			std::uint64_t m_pi_ddb_lock;
+			std::uint64_t m_mm_unloaded_drivers;
+			std::uint64_t m_mm_last_unloaded_driver;
+			std::uint64_t m_hal_dispatch_table;
+			std::uint64_t m_hal_private_dispatch_table;
+			std::uint64_t m_ki_wait_never;
+			std::uint64_t m_ki_wait_always;
+			std::uint64_t m_kd_debugger_not_present;
+			std::uint64_t m_kd_pitch_debugger;
 		} m_pdb;
 
 		struct offsets_t {
@@ -143,7 +153,7 @@ namespace service {
 				return false;
 			}
 
-			HANDLE token;
+			HANDLE token = nullptr;
 			if ( !OpenProcessToken(
 				GetCurrentProcess( ),
 				TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
@@ -163,7 +173,8 @@ namespace service {
 				nullptr
 			);
 
-			if ( !result || GetLastError( ) == ERROR_NOT_ALL_ASSIGNED ) {
+			auto last_error = GetLastError( );
+			if ( !result || last_error == ERROR_NOT_ALL_ASSIGNED ) {
 				result = AdjustTokenPrivileges(
 					token,
 					TRUE,
@@ -172,22 +183,23 @@ namespace service {
 					nullptr,
 					nullptr
 				);
+				last_error = GetLastError( );
 			}
 
-			NtClose( token );
-
-			if ( !result || GetLastError( ) == ERROR_NOT_ALL_ASSIGNED ) {
-				utility::print( obf( "[ - ]" ), obf( "AdjustTokenPrivileges failed: 0x%x" ), GetLastError( ) );
+			if ( !result || last_error == ERROR_NOT_ALL_ASSIGNED ) {
+				NtClose( token );
+				utility::print( obf( "[ - ]" ), obf( "AdjustTokenPrivileges failed: 0x%x" ), last_error );
 				return false;
 			}
 
 			TOKEN_PRIVILEGES verify_privilege{ };
-			DWORD length;
+			DWORD length = 0;
 			if ( GetTokenInformation( token, TokenPrivileges, &verify_privilege, sizeof( verify_privilege ), &length ) ) {
-				utility::print( obf( "[ - ]" ), obf( "privilege state after adjustment: 0x%x" ),
+				utility::print( obf( "[ + ]" ), obf( "privilege state after adjustment: 0x%x" ),
 					verify_privilege.Privileges[ 0 ].Attributes );
 			}
 
+			NtClose( token );
 			return true;
 		}
 
@@ -280,6 +292,16 @@ namespace service {
 			config.m_pdb.m_mi_is_page_on_bad_list = g_pdb->get_symbol_address( obf( "MiIsPageOnBadList" ) );
 			config.m_pdb.m_mi_make_page_bad = g_pdb->get_symbol_address( obf( "MiMakePageBad" ) );
 			config.m_pdb.m_ps_loaded_module_list = g_pdb->get_symbol_address( obf( "PsLoadedModuleList" ) );
+			config.m_pdb.m_pi_ddb_cache_table = g_pdb->get_symbol_address( obf( "PiDDBCacheTable" ) );
+			config.m_pdb.m_pi_ddb_lock = g_pdb->get_symbol_address( obf( "PiDDBLock" ) );
+			config.m_pdb.m_mm_unloaded_drivers = g_pdb->get_symbol_address( obf( "MmUnloadedDrivers" ) );
+			config.m_pdb.m_mm_last_unloaded_driver = g_pdb->get_symbol_address( obf( "MmLastUnloadedDriver" ) );
+			config.m_pdb.m_hal_dispatch_table = g_pdb->get_symbol_address( obf( "HalDispatchTable" ) );
+			config.m_pdb.m_hal_private_dispatch_table = g_pdb->get_symbol_address( obf( "HalPrivateDispatchTable" ) );
+			config.m_pdb.m_ki_wait_never = g_pdb->get_symbol_address( obf( "KiWaitNever" ) );
+			config.m_pdb.m_ki_wait_always = g_pdb->get_symbol_address( obf( "KiWaitAlways" ) );
+			config.m_pdb.m_kd_debugger_not_present = g_pdb->get_symbol_address( obf( "KdDebuggerNotPresent" ) );
+			config.m_pdb.m_kd_pitch_debugger = g_pdb->get_symbol_address( obf( "KdPitchDebugger" ) );
 
 			HKEY service_key = nullptr;
 			auto key_path = std::wstring( obf( L"SYSTEM\\CurrentControlSet\\Services\\" ) ) + service_name;

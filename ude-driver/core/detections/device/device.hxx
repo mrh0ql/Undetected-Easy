@@ -929,6 +929,250 @@ namespace device_surface {
 		return detections;
 	}
 
+	struct mm_unloaded_driver_t {
+		UNICODE_STRING m_name;
+		void* m_module_start;
+		void* m_module_end;
+		LARGE_INTEGER m_unload_time;
+	};
+
+	struct piddb_cache_entry_t {
+		LIST_ENTRY m_list;
+		UNICODE_STRING m_driver_name;
+		ULONG m_time_date_stamp;
+		NTSTATUS m_load_status;
+		char m_shim_data[ 16 ];
+	};
+
+	unsigned long scan_mm_unloaded_drivers( ioctl::command_t* command ) {
+		if ( !command || !m_entry.m_pdb.m_mm_unloaded_drivers )
+			return 0;
+
+		mm_unloaded_driver_t* table_ptr = nullptr;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory(
+			reinterpret_cast< void* >( m_entry.m_pdb.m_mm_unloaded_drivers ),
+			sizeof( table_ptr ),
+			&table_ptr,
+			&copied ) || !table_ptr || !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( table_ptr ) ) )
+			return 0;
+
+		constexpr auto max_unloaded_drivers = 50ul;
+		mm_unloaded_driver_t entries[ max_unloaded_drivers ]{ };
+		if ( !memory::copy_kernel_memory( table_ptr, sizeof( entries ), entries, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto index = 0ul; index < max_unloaded_drivers; index++ ) {
+			const auto& item = entries[ index ];
+			if ( !item.m_module_start && !item.m_module_end && !item.m_name.Buffer && !item.m_name.Length )
+				continue;
+
+			auto entry_address = reinterpret_cast< unsigned long long >( table_ptr ) + index * sizeof( mm_unloaded_driver_t );
+
+			if ( ( item.m_module_start || item.m_module_end ) && ( !item.m_name.Buffer || !item.m_name.Length ) ) {
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"index=%lu start=0x%llx end=0x%llx reason=wiped_unloaded_driver_name",
+					index,
+					reinterpret_cast< unsigned long long >( item.m_module_start ),
+					reinterpret_cast< unsigned long long >( item.m_module_end )
+				);
+				report::add_memory_detection(
+					command,
+					"MmUnloadedDrivers",
+					report::m_mm_unloaded_driver_violation,
+					detail,
+					entry_address,
+					sizeof( mm_unloaded_driver_t )
+				);
+				detections++;
+				continue;
+			}
+
+			if ( !unicode_name_sane( item.m_name ) )
+				continue;
+
+			wchar_t wide_name[ 128 ]{ };
+			auto copy_bytes = item.m_name.Length < ( sizeof( wide_name ) - sizeof( wchar_t ) )
+				? item.m_name.Length
+				: ( sizeof( wide_name ) - sizeof( wchar_t ) );
+			if ( !memory::copy_kernel_memory( item.m_name.Buffer, copy_bytes, wide_name, &copied ) )
+				continue;
+
+			UNICODE_STRING safe_unicode{ };
+			safe_unicode.Buffer = wide_name;
+			safe_unicode.Length = static_cast< USHORT >( copy_bytes );
+			safe_unicode.MaximumLength = sizeof( wide_name );
+
+			char driver_name[ 128 ]{ };
+			if ( !unicode_to_ascii( safe_unicode, driver_name, sizeof( driver_name ) ) || !driver_name[ 0 ] )
+				continue;
+
+			char rule_detail[ 160 ]{ };
+			if ( callback::is_driver_name_blocked( driver_name, rule_detail, sizeof( rule_detail ) ) ) {
+				KeEnterCriticalRegion( );
+				ExAcquirePushLockExclusive( &callback::m_blocklist_lock );
+				callback::record_blocked_driver_locked( driver_name );
+				ExReleasePushLockExclusive( &callback::m_blocklist_lock );
+				KeLeaveCriticalRegion( );
+
+				char target[ ioctl::m_detection_target_size ]{ };
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA( target, sizeof( target ), "MmUnloadedDrivers!%s", driver_name );
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"unloaded_driver=%s start=0x%llx end=0x%llx %s",
+					driver_name,
+					reinterpret_cast< unsigned long long >( item.m_module_start ),
+					reinterpret_cast< unsigned long long >( item.m_module_end ),
+					rule_detail
+				);
+				report::add_memory_detection(
+					command,
+					target,
+					report::m_vulnerable_driver_blocklist_violation,
+					detail,
+					entry_address,
+					sizeof( mm_unloaded_driver_t )
+				);
+				detections++;
+			}
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_pi_ddb_cache_table( ioctl::command_t* command ) {
+		if ( !command || !m_entry.m_pdb.m_pi_ddb_cache_table )
+			return 0;
+
+		auto table_address = m_entry.m_pdb.m_pi_ddb_cache_table;
+		if ( !memory::is_canonical_kernel_address( table_address ) )
+			return 0;
+
+		LIST_ENTRY head_copy{ };
+		size_t copied = 0;
+		auto list_head = reinterpret_cast< LIST_ENTRY* >( table_address + 0x10 );
+		if ( !memory::copy_kernel_memory( list_head, sizeof( head_copy ), &head_copy, &copied ) )
+			return 0;
+
+		if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( head_copy.Flink ) ) ||
+			!memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( head_copy.Blink ) ) )
+			return 0;
+
+		unsigned long detections = 0;
+		unsigned long walked = 0;
+		auto current = head_copy.Flink;
+
+		while ( current && current != list_head && walked < 2048 ) {
+			if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( current ) ) )
+				break;
+
+			piddb_cache_entry_t entry{ };
+			if ( !memory::copy_kernel_memory( current, sizeof( entry ), &entry, &copied ) )
+				break;
+
+			if ( !entry.m_list.Flink || !entry.m_list.Blink ) {
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"entry=0x%llx flink=0x%llx blink=0x%llx reason=broken_piddb_links",
+					reinterpret_cast< unsigned long long >( current ),
+					reinterpret_cast< unsigned long long >( entry.m_list.Flink ),
+					reinterpret_cast< unsigned long long >( entry.m_list.Blink )
+				);
+				report::add_memory_detection(
+					command,
+					"PiDDBCacheTable",
+					report::m_piddb_cache_entry_violation,
+					detail,
+					reinterpret_cast< unsigned long long >( current ),
+					sizeof( piddb_cache_entry_t )
+				);
+				detections++;
+				break;
+			}
+
+			if ( unicode_name_sane( entry.m_driver_name ) ) {
+				wchar_t wide_name[ 128 ]{ };
+				auto copy_bytes = entry.m_driver_name.Length < ( sizeof( wide_name ) - sizeof( wchar_t ) )
+					? entry.m_driver_name.Length
+					: ( sizeof( wide_name ) - sizeof( wchar_t ) );
+				if ( memory::copy_kernel_memory( entry.m_driver_name.Buffer, copy_bytes, wide_name, &copied ) ) {
+					UNICODE_STRING safe_unicode{ };
+					safe_unicode.Buffer = wide_name;
+					safe_unicode.Length = static_cast< USHORT >( copy_bytes );
+					safe_unicode.MaximumLength = sizeof( wide_name );
+
+					char driver_name[ 128 ]{ };
+					if ( unicode_to_ascii( safe_unicode, driver_name, sizeof( driver_name ) ) && driver_name[ 0 ] ) {
+						char rule_detail[ 160 ]{ };
+						if ( callback::is_driver_name_blocked( driver_name, rule_detail, sizeof( rule_detail ) ) ) {
+							KeEnterCriticalRegion( );
+							ExAcquirePushLockExclusive( &callback::m_blocklist_lock );
+							callback::record_blocked_driver_locked( driver_name );
+							ExReleasePushLockExclusive( &callback::m_blocklist_lock );
+							KeLeaveCriticalRegion( );
+
+							char target[ ioctl::m_detection_target_size ]{ };
+							char detail[ ioctl::m_detection_text_size ]{ };
+							RtlStringCbPrintfA( target, sizeof( target ), "PiDDBCacheTable!%s", driver_name );
+							RtlStringCbPrintfA(
+								detail,
+								sizeof( detail ),
+								"cached_driver=%s timestamp=0x%lx status=0x%lx %s",
+								driver_name,
+								entry.m_time_date_stamp,
+								static_cast< unsigned long >( entry.m_load_status ),
+								rule_detail
+							);
+							report::add_memory_detection(
+								command,
+								target,
+								report::m_vulnerable_driver_blocklist_violation,
+								detail,
+								reinterpret_cast< unsigned long long >( current ),
+								sizeof( piddb_cache_entry_t )
+							);
+							detections++;
+						}
+						else if ( !entry.m_time_date_stamp && !module::disk::is_whitelisted_owner( driver_name ) ) {
+							char target[ ioctl::m_detection_target_size ]{ };
+							char detail[ ioctl::m_detection_text_size ]{ };
+							RtlStringCbPrintfA( target, sizeof( target ), "PiDDBCacheTable!%s", driver_name );
+							RtlStringCbPrintfA(
+								detail,
+								sizeof( detail ),
+								"cached_driver=%s timestamp=0x0 status=0x%lx reason=zeroed_timestamp",
+								driver_name,
+								static_cast< unsigned long >( entry.m_load_status )
+							);
+							report::add_memory_detection(
+								command,
+								target,
+								report::m_piddb_cache_entry_violation,
+								detail,
+								reinterpret_cast< unsigned long long >( current ),
+								sizeof( piddb_cache_entry_t )
+							);
+							detections++;
+						}
+					}
+				}
+			}
+
+			current = entry.m_list.Flink;
+			walked++;
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
@@ -962,6 +1206,9 @@ namespace device_surface {
 		detections += scan_loaded_module_list( command, modules );
 		detections += scan_device_directory_objects( command, modules, scanned_drivers, &scanned_driver_count, &driver_objects );
 		detections += scan_driver_directory( command, modules, scanned_drivers, &scanned_driver_count, &driver_objects );
+		detections += callback::scan_loaded_modules( command, modules );
+		detections += scan_mm_unloaded_drivers( command );
+		detections += scan_pi_ddb_cache_table( command );
 
 		utility::print(
 			"device surface: modules=%lu resolved_drivers=%lu driver_objects=%lu detections=%lu\n",

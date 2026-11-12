@@ -92,6 +92,12 @@ namespace report {
 	constexpr const char* m_cid_process_missing_violation = "cid table process missing from system query";
 	constexpr const char* m_thread_hidden_violation = "thread hidden from system query";
 	constexpr const char* m_orphan_process_address_space_violation = "orphan process address space";
+	constexpr const char* m_vulnerable_driver_blocklist_violation = "vulnerable driver on microsoft blocklist";
+	constexpr const char* m_piddb_cache_entry_violation = "suspicious piddbcachetable driver entry";
+	constexpr const char* m_mm_unloaded_driver_violation = "suspicious mmunloadeddrivers entry";
+	constexpr const char* m_hal_dispatch_target_violation = "hal dispatch table target outside trusted code";
+	constexpr const char* m_patchguard_context_violation = "patchguard or kernel debug state tampered";
+	constexpr const char* m_timer_dpc_target_violation = "kernel timer dpc target outside trusted code";
 	constexpr bool m_report_generic_code_changes = false;
 
 	const char* violation_name_for_branch_signature( const char* signature_type ) {
@@ -746,6 +752,11 @@ namespace report {
 				auto live_owner = memory::lookup_address_owner( modules, signature.m_target );
 				auto disk_owner = disk_has_relative_branch ? memory::lookup_address_owner( modules, disk_signature.m_target ) : nullptr;
 
+				if ( disk_has_relative_branch &&
+					ascii_equal_insensitive( disk_signature.m_type, signature.m_type ) &&
+					disk_signature.m_target == signature.m_target )
+					continue;
+
 				utility::print(
 					"rel_branch: rva=0x%x type=%s live_target=0x%llx live_owner=%s disk_has_branch=%d disk_target=0x%llx disk_owner=%s\n",
 					text_rva + test_offset,
@@ -756,6 +767,33 @@ namespace report {
 					disk_has_relative_branch ? disk_signature.m_target : 0,
 					disk_owner ? disk_owner : "unknown"
 				);
+
+				if ( !detections::is_suspicious_external_target( modules, module, signature.m_target ) )
+					continue;
+
+				char extra[ 64 ]{ };
+				RtlStringCbPrintfA(
+					extra,
+					sizeof( extra ),
+					"target=0x%llx owner=%s",
+					signature.m_target,
+					live_owner ? live_owner : "unknown"
+				);
+
+				add_text_detection(
+					command,
+					module_name,
+					section_name,
+					violation_name_for_branch_signature( signature.m_type ),
+					text_rva + test_offset,
+					live_address + test_offset,
+					signature.m_size,
+					extra
+				);
+				reported_detection = true;
+
+				if ( stats )
+					stats->m_relative_branch_detections++;
 			}
 
 			for ( auto test_offset = scan_start; test_offset < offset; test_offset++ ) {

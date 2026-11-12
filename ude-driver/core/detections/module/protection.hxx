@@ -233,18 +233,26 @@ pfn_scan_result_t scan_page_pfn(
 	unsigned long page_size ) {
 	pfn_scan_result_t result{ };
 
-	if ( pt_entries.m_pte.hard.pfn )
+	const auto one_gb = pt_entries.m_pdpte.hard.page_size != 0;
+	const auto two_mb = !one_gb && pt_entries.m_pde.hard.page_size != 0;
+
+	if ( !one_gb && !two_mb && !pt_entries.m_pte.hard.pfn )
 		return result;
 
-	if ( !pt_entries.m_pde.hard.page_size ) {
-		result.m_flags = static_cast< pfn_suspicion_t >(
-			static_cast< unsigned long >( result.m_flags ) |
-			static_cast< unsigned long >( pfn_suspicion_t::large_page_split )
-		);
+	if ( one_gb ) {
+		auto pfn = pt_entries.m_pdpte.hard.pfn & ~( ( page_1gb_size / page_4kb_size ) - 1 );
+		result.m_pa_from_walk = ( static_cast< unsigned long long >( pfn ) << PAGE_SHIFT ) |
+			( virtual_address & page_1gb_mask );
 	}
-
-	result.m_pa_from_walk = static_cast< unsigned long long >(
-		pt_entries.m_pte.hard.pfn ) << PAGE_SHIFT;
+	else if ( two_mb ) {
+		auto pfn = pt_entries.m_pde.hard.pfn & ~( ( page_2mb_size / page_4kb_size ) - 1 );
+		result.m_pa_from_walk = ( static_cast< unsigned long long >( pfn ) << PAGE_SHIFT ) |
+			( virtual_address & page_2mb_mask );
+	}
+	else {
+		result.m_pa_from_walk = ( static_cast< unsigned long long >( pt_entries.m_pte.hard.pfn ) << PAGE_SHIFT ) |
+			( virtual_address & page_4kb_mask );
+	}
 
 	PHYSICAL_ADDRESS pa{ };
 	pa = MmGetPhysicalAddress( reinterpret_cast< void* >( virtual_address ) );
@@ -259,12 +267,19 @@ pfn_scan_result_t scan_page_pfn(
 		}
 	}
 
+	if ( !one_gb && !two_mb && ( pt_entries.m_pte.hard.dirty || pt_entries.m_pte.hard.read_write ) ) {
+		result.m_flags = static_cast< pfn_suspicion_t >(
+			static_cast< unsigned long >( result.m_flags ) |
+			static_cast< unsigned long >( pfn_suspicion_t::large_page_split )
+		);
+	}
+
 	if ( page_bytes && page_size ) {
 		for ( auto i = 0ul; i < page_size; i++ )
 			if ( page_bytes[ i ] == 0 )
 				result.m_zero_byte_count++;
 
-		if ( result.m_zero_byte_count > page_size / 4 ) {
+		if ( result.m_zero_byte_count > ( page_size * 3 ) / 4 ) {
 			result.m_flags = static_cast< pfn_suspicion_t >(
 				static_cast< unsigned long >( result.m_flags ) |
 				static_cast< unsigned long >( pfn_suspicion_t::high_zero_density )
