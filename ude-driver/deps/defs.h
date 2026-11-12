@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 constexpr auto page_4kb_size = 0x1000ull;
 constexpr auto page_2mb_size = 0x200000ull;
@@ -70,6 +70,12 @@ extern "C" NTKERNELAPI const char* NTAPI PsGetProcessImageFileName(
 
 extern "C" POBJECT_TYPE* IoDriverObjectType;
 extern "C" POBJECT_TYPE* IoDeviceObjectType;
+extern "C" POBJECT_TYPE* PsProcessType;
+extern "C" POBJECT_TYPE* PsThreadType;
+
+extern "C" NTKERNELAPI BOOLEAN NTAPI PsIsSystemThread(
+	PETHREAD thread
+);
 
 extern "C" NTSYSAPI NTSTATUS NTAPI ObReferenceObjectByName(
 	PUNICODE_STRING object_name,

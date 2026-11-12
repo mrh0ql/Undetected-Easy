@@ -1173,6 +1173,274 @@ namespace device_surface {
 		return detections;
 	}
 
+	struct ci_hash_bucket_entry_t {
+		ci_hash_bucket_entry_t* m_next;
+		UNICODE_STRING m_driver_name;
+		unsigned char m_cert_hash[ 20 ];
+	};
+
+	unsigned long scan_ci_hash_bucket_list( ioctl::command_t* command ) {
+		auto head_address = m_entry.m_pdb.m_ci_kernel_hash_bucket_list;
+		if ( !command || !head_address || !memory::is_canonical_kernel_address( head_address ) )
+			return 0;
+
+		ci_hash_bucket_entry_t* current = nullptr;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( head_address ), sizeof( current ), &current, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto walked = 0ul; current && walked < 1024ul; walked++ ) {
+			auto current_va = reinterpret_cast< unsigned long long >( current );
+			if ( !memory::is_canonical_kernel_address( current_va ) )
+				break;
+
+			ci_hash_bucket_entry_t entry{ };
+			if ( !memory::copy_kernel_memory( current, sizeof( entry ), &entry, &copied ) )
+				break;
+
+			bool hash_all_zero = true;
+			for ( auto i = 0u; i < sizeof( entry.m_cert_hash ); i++ ) {
+				if ( entry.m_cert_hash[ i ] != 0 ) {
+					hash_all_zero = false;
+					break;
+				}
+			}
+
+			char full_path[ 256 ]{ };
+			const char* base_name = full_path;
+			if ( unicode_name_sane( entry.m_driver_name ) ) {
+				wchar_t wide_path[ 256 ]{ };
+				auto copy_bytes = entry.m_driver_name.Length < ( sizeof( wide_path ) - sizeof( wchar_t ) )
+					? entry.m_driver_name.Length
+					: ( sizeof( wide_path ) - sizeof( wchar_t ) );
+				if ( memory::copy_kernel_memory( entry.m_driver_name.Buffer, copy_bytes, wide_path, &copied ) ) {
+					UNICODE_STRING safe_u{ static_cast< USHORT >( copy_bytes ), sizeof( wide_path ), wide_path };
+					unicode_to_ascii( safe_u, full_path, sizeof( full_path ) );
+					for ( auto p = full_path; *p; ++p ) {
+						if ( *p == '\\' || *p == '/' )
+							base_name = p + 1;
+					}
+				}
+			}
+
+			sha1_digest_t digest{ };
+			memcpy( digest.m_bytes, entry.m_cert_hash, sizeof( digest.m_bytes ) );
+			char sha1_hex[ 41 ]{ };
+			callback::format_sha1_hex( digest, sha1_hex, sizeof( sha1_hex ) );
+
+			char rule_detail[ 160 ]{ };
+			bool blocked = ( base_name[ 0 ] && callback::is_driver_name_blocked( base_name, rule_detail, sizeof( rule_detail ) ) ) ||
+				( !hash_all_zero && callback::is_driver_sha1_blocked( sha1_hex, rule_detail, sizeof( rule_detail ) ) );
+
+			if ( blocked ) {
+				if ( base_name[ 0 ] ) {
+					KeEnterCriticalRegion( );
+					ExAcquirePushLockExclusive( &callback::m_blocklist_lock );
+					callback::record_blocked_driver_locked( base_name );
+					ExReleasePushLockExclusive( &callback::m_blocklist_lock );
+					KeLeaveCriticalRegion( );
+				}
+
+				char target[ ioctl::m_detection_target_size ]{ };
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA( target, sizeof( target ), "KernelHashBucketList!%s", base_name[ 0 ] ? base_name : "driver" );
+				RtlStringCbPrintfA( detail, sizeof( detail ), "driver=%s cert_sha1=%s %s", base_name[ 0 ] ? base_name : "unknown", sha1_hex, rule_detail );
+				report::add_memory_detection( command, target, report::m_vulnerable_driver_blocklist_violation, detail, current_va, sizeof( entry ) );
+				detections++;
+			}
+			else if ( ( base_name[ 0 ] && hash_all_zero && !module::disk::is_whitelisted_owner( base_name ) ) ||
+				( !base_name[ 0 ] && !hash_all_zero ) ) {
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"entry=0x%llx driver=%s hash_zero=%u reason=tampered_ci_hash_bucket",
+					current_va,
+					base_name[ 0 ] ? base_name : "wiped",
+					hash_all_zero ? 1ul : 0ul
+				);
+				report::add_memory_detection( command, "CI.dll!g_KernelHashBucketList", report::m_ci_hash_bucket_violation, detail, current_va, sizeof( entry ) );
+				detections++;
+			}
+
+			current = entry.m_next;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_attached_stack(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const char* base_label,
+		PDEVICE_OBJECT base_device,
+		PDRIVER_OBJECT* scanned,
+		unsigned long* scanned_count ) {
+		if ( !command || !modules || !base_device )
+			return 0;
+
+		unsigned long detections = 0;
+		auto attached = base_device->AttachedDevice;
+		for ( auto depth = 0ul; attached && depth < 32ul; depth++ ) {
+			if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( attached ) ) )
+				break;
+
+			detections += scan_referenced_device( command, modules, base_label, attached, scanned, scanned_count );
+			attached = attached->AttachedDevice;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_named_driver_directory(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const wchar_t* dir_path,
+		PDRIVER_OBJECT* scanned,
+		unsigned long* scanned_count,
+		unsigned long* objects ) {
+		HANDLE directory = nullptr;
+		if ( !open_object_directory( dir_path, &directory ) )
+			return 0;
+
+		auto buffer = memory::allocate_pool( m_directory_buffer_size, 1 );
+		if ( !buffer ) {
+			ZwClose( directory );
+			return 0;
+		}
+
+		ULONG context = 0;
+		ULONG returned = 0;
+		unsigned long detections = 0;
+
+		while ( true ) {
+			memset( buffer, 0, m_directory_buffer_size );
+			if ( ZwQueryDirectoryObject( directory, buffer, m_directory_buffer_size, TRUE, FALSE, &context, &returned ) )
+				break;
+
+			auto entry = static_cast< object_directory_information_t* >( buffer );
+			char type_name[ 64 ]{ };
+			char object_name[ 128 ]{ };
+			unicode_to_ascii( entry->m_type_name, type_name, sizeof( type_name ) );
+			unicode_to_ascii( entry->m_name, object_name, sizeof( object_name ) );
+			if ( !ascii_equal_insensitive( type_name, "Driver" ) && !ascii_equal_insensitive( type_name, "Device" ) )
+				continue;
+
+			char full_path[ 192 ]{ };
+			RtlStringCbPrintfA( full_path, sizeof( full_path ), "%ws\\%s", dir_path, object_name );
+			ANSI_STRING ansi{ };
+			UNICODE_STRING unicode{ };
+			RtlInitAnsiString( &ansi, full_path );
+			if ( RtlAnsiStringToUnicodeString( &unicode, &ansi, TRUE ) )
+				continue;
+
+			void* obj = nullptr;
+			auto expected_type = ascii_equal_insensitive( type_name, "Driver" ) ? *IoDriverObjectType : *IoDeviceObjectType;
+			auto status = ObReferenceObjectByName( &unicode, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, 0, expected_type, KernelMode, nullptr, &obj );
+			RtlFreeUnicodeString( &unicode );
+			if ( status || !obj )
+				continue;
+
+			if ( objects )
+				( *objects )++;
+
+			if ( ascii_equal_insensitive( type_name, "Driver" ) ) {
+				auto drv = static_cast< PDRIVER_OBJECT >( obj );
+				if ( !already_scanned_driver( scanned, *scanned_count, drv ) ) {
+					auto owner_mod = find_driver_owner_module( modules, drv );
+					auto host_mod = owner_mod ? nullptr : find_trusted_dispatch_host_module( modules, drv );
+					if ( host_mod )
+						detections += scan_trusted_hosted_driver( command, modules, host_mod, drv, object_name );
+					else
+						detections += scan_driver_object( command, modules, owner_mod, drv, object_name );
+					remember_scanned_driver( scanned, scanned_count, drv );
+				}
+				for ( auto dev = drv->DeviceObject; dev; dev = dev->NextDevice )
+					detections += scan_attached_stack( command, modules, object_name, dev, scanned, scanned_count );
+			}
+			else {
+				auto dev = static_cast< PDEVICE_OBJECT >( obj );
+				detections += scan_referenced_device( command, modules, object_name, dev, scanned, scanned_count );
+				detections += scan_attached_stack( command, modules, object_name, dev, scanned, scanned_count );
+			}
+
+			ObDereferenceObject( obj );
+		}
+
+		memory::free_pool( buffer );
+		ZwClose( directory );
+		return detections;
+	}
+
+	unsigned long scan_pci_device_stack(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		PDRIVER_OBJECT* scanned,
+		unsigned long* scanned_count ) {
+		PDRIVER_OBJECT pci_driver = nullptr;
+		if ( !reference_driver_object( "pci", &pci_driver ) || !pci_driver )
+			return 0;
+
+		unsigned long detections = 0;
+		unsigned long walked = 0;
+		for ( auto dev = pci_driver->DeviceObject; dev && walked < 256ul; dev = dev->NextDevice, walked++ )
+			detections += scan_attached_stack( command, modules, "pci_stack", dev, scanned, scanned_count );
+
+		ObDereferenceObject( pci_driver );
+		return detections;
+	}
+
+	unsigned long scan_ndis_filters( ioctl::command_t* command, const system_modules_t* modules ) {
+		auto list_va = m_entry.m_pdb.m_ndis_global_filter_list;
+		if ( !command || !modules || !list_va || !memory::is_canonical_kernel_address( list_va ) )
+			return 0;
+
+		unsigned long long current = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( list_va ), sizeof( current ), &current, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto walked = 0ul; current && walked < 128ul; walked++ ) {
+			if ( !memory::is_canonical_kernel_address( current ) )
+				break;
+
+			unsigned char block[ 0x30 ]{ };
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( current ), sizeof( block ), block, &copied ) )
+				break;
+
+			unsigned long long next_filter = 0;
+			PDRIVER_OBJECT filter_driver = nullptr;
+			memcpy( &next_filter, block + 0x08, sizeof( next_filter ) );
+			memcpy( &filter_driver, block + 0x18, sizeof( filter_driver ) );
+
+			if ( filter_driver && memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( filter_driver ) ) ) {
+				DRIVER_OBJECT drv_copy{ };
+				if ( memory::copy_kernel_memory( filter_driver, sizeof( drv_copy ), &drv_copy, &copied ) && drv_copy.Type == 4 ) {
+					auto owner = find_driver_owner_module( modules, &drv_copy );
+					if ( !owner ) {
+						char detail[ ioctl::m_detection_text_size ]{ };
+						RtlStringCbPrintfA(
+							detail,
+							sizeof( detail ),
+							"ndis_block=0x%llx driver=0x%llx start=0x%llx reason=unbacked_ndis_filter_driver",
+							current,
+							reinterpret_cast< unsigned long long >( filter_driver ),
+							reinterpret_cast< unsigned long long >( drv_copy.DriverStart )
+						);
+						report::add_memory_detection( command, "ndis!ndisGlobalFilterList", report::m_filter_callback_violation, detail, current, sizeof( block ) );
+						detections++;
+					}
+				}
+			}
+
+			current = next_filter;
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
@@ -1206,9 +1474,14 @@ namespace device_surface {
 		detections += scan_loaded_module_list( command, modules );
 		detections += scan_device_directory_objects( command, modules, scanned_drivers, &scanned_driver_count, &driver_objects );
 		detections += scan_driver_directory( command, modules, scanned_drivers, &scanned_driver_count, &driver_objects );
+		detections += scan_named_driver_directory( command, modules, L"\\FileSystem", scanned_drivers, &scanned_driver_count, &driver_objects );
+		detections += scan_named_driver_directory( command, modules, L"\\FileSystem\\Filters", scanned_drivers, &scanned_driver_count, &driver_objects );
+		detections += scan_pci_device_stack( command, modules, scanned_drivers, &scanned_driver_count );
+		detections += scan_ndis_filters( command, modules );
 		detections += callback::scan_loaded_modules( command, modules );
 		detections += scan_mm_unloaded_drivers( command );
 		detections += scan_pi_ddb_cache_table( command );
+		detections += scan_ci_hash_bucket_list( command );
 
 		utility::print(
 			"device surface: modules=%lu resolved_drivers=%lu driver_objects=%lu detections=%lu\n",

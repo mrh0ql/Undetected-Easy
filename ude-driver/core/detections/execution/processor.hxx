@@ -13,16 +13,32 @@ namespace execution::processor {
 		ipi_callback = 2
 	};
 
+	constexpr auto m_max_sample_frames = 16ul;
+
+	struct kaffinity_ex_t {
+		USHORT m_count;
+		USHORT m_size;
+		ULONG m_reserved;
+		ULONG_PTR m_bitmap[ 20 ];
+	};
+
+	using ke_initialize_affinity_ex_t = void( NTAPI* )( kaffinity_ex_t* affinity );
+	using ke_add_processor_affinity_ex_t = void( NTAPI* )( kaffinity_ex_t* affinity, ULONG processor_index );
+	using hal_send_nmi_t = void( NTAPI* )( kaffinity_ex_t* affinity );
+
 	struct processor_sample_t {
 		bool m_valid;
 		bool m_interrupted_context;
 		unsigned long m_processor;
 		unsigned long long m_rip;
 		unsigned long long m_rsp;
+		unsigned long m_frame_count;
+		unsigned long long m_frames[ m_max_sample_frames ];
 		sample_source_t m_source;
 	};
 
 	struct sample_context_t {
+		volatile long m_pending_nmi[ m_max_processor_samples ];
 		processor_sample_t m_samples[ m_max_processor_samples ];
 	};
 
@@ -52,36 +68,107 @@ namespace execution::processor {
 		}
 	}
 
+	void scan_resident_stack_page( unsigned long long start_rsp, processor_sample_t* sample, bool look_for_iretq ) {
+		if ( !sample || !memory::is_canonical_kernel_address( start_rsp ) )
+			return;
+
+		auto aligned_rsp = ( start_rsp + 7ull ) & ~7ull;
+		auto page_end = ( start_rsp & ~0xfffull ) + PAGE_SIZE;
+
+		if ( look_for_iretq ) {
+			for ( auto cursor = aligned_rsp; cursor + 5 * sizeof( unsigned long long ) <= page_end; cursor += sizeof( unsigned long long ) ) {
+				const auto frame = reinterpret_cast< const unsigned long long* >( cursor );
+				const auto candidate_rip = frame[ 0 ];
+				const auto candidate_cs = frame[ 1 ];
+				const auto candidate_rflags = frame[ 2 ];
+				const auto candidate_rsp = frame[ 3 ];
+				const auto candidate_ss = frame[ 4 ];
+
+				if ( candidate_cs == 0x10ull &&
+					candidate_ss == 0x18ull &&
+					( candidate_rflags & 0x2ull ) != 0 &&
+					memory::is_canonical_kernel_address( candidate_rip ) &&
+					memory::is_canonical_kernel_address( candidate_rsp ) &&
+					( candidate_rsp & 0x7ull ) == 0 ) {
+					sample->m_rip = candidate_rip;
+					sample->m_rsp = candidate_rsp;
+					sample->m_interrupted_context = true;
+					break;
+				}
+			}
+		}
+
+		auto frame_cursor = aligned_rsp;
+		auto frame_page_end = page_end;
+		if ( sample->m_interrupted_context &&
+			MmIsAddressValid( reinterpret_cast< void* >( sample->m_rsp ) ) ) {
+			frame_cursor = ( sample->m_rsp + 7ull ) & ~7ull;
+			frame_page_end = ( sample->m_rsp & ~0xfffull ) + PAGE_SIZE;
+		}
+
+		for ( auto cursor = frame_cursor;
+			cursor + sizeof( unsigned long long ) <= frame_page_end && sample->m_frame_count < m_max_sample_frames;
+			cursor += sizeof( unsigned long long ) ) {
+			auto value = *reinterpret_cast< const unsigned long long* >( cursor );
+			if ( !memory::is_canonical_kernel_address( value ) )
+				continue;
+
+			bool duplicate = false;
+			for ( auto i = 0ul; i < sample->m_frame_count; i++ ) {
+				if ( sample->m_frames[ i ] == value ) {
+					duplicate = true;
+					break;
+				}
+			}
+			if ( !duplicate )
+				sample->m_frames[ sample->m_frame_count++ ] = value;
+		}
+	}
+
 	void capture_processor_sample( sample_context_t* samples, sample_source_t source, bool interrupted_context ) {
 		if ( !samples )
 			return;
 
-		auto processor = KeGetCurrentProcessorNumber( );
+		auto processor = KeGetCurrentProcessorNumberEx( nullptr );
 		if ( processor >= m_max_processor_samples )
 			return;
 
 		auto sample = &samples->m_samples[ processor ];
-		sample->m_valid = true;
-		sample->m_interrupted_context = interrupted_context;
 		sample->m_processor = processor;
 		sample->m_rip = reinterpret_cast< unsigned long long >( _ReturnAddress( ) );
 		sample->m_rsp = reinterpret_cast< unsigned long long >( _AddressOfReturnAddress( ) );
+		sample->m_interrupted_context = interrupted_context;
+		sample->m_frame_count = 0;
 		sample->m_source = source;
+
+		scan_resident_stack_page( sample->m_rsp, sample, source == sample_source_t::nmi_callback );
+		sample->m_valid = true;
 	}
 
 	BOOLEAN nmi_sample_callback( void* context, BOOLEAN handled ) {
-		capture_processor_sample(
-			reinterpret_cast< sample_context_t* >( context ),
-			sample_source_t::nmi_callback,
-			false
-		);
+		auto samples = reinterpret_cast< sample_context_t* >( context );
+		if ( !samples )
+			return handled;
+
+		auto processor = KeGetCurrentProcessorNumberEx( nullptr );
+		capture_processor_sample( samples, sample_source_t::nmi_callback, false );
+
+		if ( processor < m_max_processor_samples &&
+			InterlockedCompareExchange( &samples->m_pending_nmi[ processor ], 0, 1 ) == 1 )
+			return TRUE;
 
 		return handled;
 	}
 
 	ULONG_PTR ipi_callback_sample_callback( ULONG_PTR context ) {
 		auto samples = reinterpret_cast< sample_context_t* >( context );
-		capture_processor_sample( samples, sample_source_t::ipi_callback, false );
+		if ( !samples )
+			return 0;
+
+		auto processor = KeGetCurrentProcessorNumberEx( nullptr );
+		if ( processor < m_max_processor_samples && !samples->m_samples[ processor ].m_valid )
+			capture_processor_sample( samples, sample_source_t::ipi_callback, false );
+
 		return 0;
 	}
 
@@ -120,23 +207,60 @@ namespace execution::processor {
 		if ( !samples )
 			return 0;
 
+		UNICODE_STRING init_affinity_name = RTL_CONSTANT_STRING( L"KeInitializeAffinityEx" );
+		UNICODE_STRING add_affinity_name = RTL_CONSTANT_STRING( L"KeAddProcessorAffinityEx" );
+		UNICODE_STRING hal_send_nmi_name = RTL_CONSTANT_STRING( L"HalSendNMI" );
+
+		auto ke_init_affinity = reinterpret_cast< ke_initialize_affinity_ex_t >( MmGetSystemRoutineAddress( &init_affinity_name ) );
+		auto ke_add_affinity = reinterpret_cast< ke_add_processor_affinity_ex_t >( MmGetSystemRoutineAddress( &add_affinity_name ) );
+		auto hal_send_nmi = reinterpret_cast< hal_send_nmi_t >( MmGetSystemRoutineAddress( &hal_send_nmi_name ) );
+		if ( !hal_send_nmi && m_entry.m_pdb.m_hal_send_nmi && memory::is_canonical_kernel_address( m_entry.m_pdb.m_hal_send_nmi ) )
+			hal_send_nmi = reinterpret_cast< hal_send_nmi_t >( m_entry.m_pdb.m_hal_send_nmi );
+
+		auto processor_count = KeQueryActiveProcessorCountEx( ALL_PROCESSOR_GROUPS );
+		if ( processor_count > m_max_processor_samples )
+			processor_count = m_max_processor_samples;
+
 		auto nmi_handle = KeRegisterNmiCallback( nmi_sample_callback, samples );
 		if ( nmi_handle ) {
-			for ( auto attempt = 0ul; attempt < m_nmi_wait_attempts; attempt++ ) {
-				if ( count_samples( *samples ) )
-					break;
+			if ( ke_init_affinity && ke_add_affinity && hal_send_nmi && processor_count > 0 ) {
+				auto caller_cpu = KeGetCurrentProcessorNumberEx( nullptr );
+				for ( auto cpu = 0ul; cpu < processor_count; cpu++ ) {
+					if ( cpu == caller_cpu )
+						continue;
 
-				KeStallExecutionProcessor( m_nmi_wait_microseconds );
+					kaffinity_ex_t affinity{ };
+					ke_init_affinity( &affinity );
+					ke_add_affinity( &affinity, cpu );
+
+					InterlockedExchange( &samples->m_pending_nmi[ cpu ], 1 );
+					hal_send_nmi( &affinity );
+
+					for ( auto wait = 0ul; wait < 20ul; wait++ ) {
+						if ( InterlockedCompareExchange( &samples->m_pending_nmi[ cpu ], 0, 0 ) == 0 )
+							break;
+						KeStallExecutionProcessor( 100 );
+					}
+					InterlockedExchange( &samples->m_pending_nmi[ cpu ], 0 );
+				}
+
+				KeStallExecutionProcessor( 500 );
+			}
+			else {
+				for ( auto attempt = 0ul; attempt < m_nmi_wait_attempts; attempt++ ) {
+					if ( count_samples( *samples ) )
+						break;
+
+					KeStallExecutionProcessor( m_nmi_wait_microseconds );
+				}
 			}
 
 			KeDeregisterNmiCallback( nmi_handle );
 		}
 
-		auto nmi_samples = count_samples( *samples );
-		if ( nmi_samples )
-			return nmi_samples;
+		if ( count_samples( *samples ) < processor_count )
+			KeIpiGenericCall( ipi_callback_sample_callback, reinterpret_cast< ULONG_PTR >( samples ) );
 
-		KeIpiGenericCall( ipi_callback_sample_callback, reinterpret_cast< ULONG_PTR >( samples ) );
 		return count_samples( *samples );
 	}
 
@@ -447,6 +571,33 @@ namespace execution::processor {
 		return detections;
 	}
 
+	bool is_probable_return_site( unsigned long long address, const address_info_t& info ) {
+		if ( !info.m_pte_valid )
+			return false;
+
+		const auto page_executable = info.m_entries.m_pdpte.hard.page_size ? !info.m_entries.m_pdpte.hard.no_execute :
+			info.m_entries.m_pde.hard.page_size ? !info.m_entries.m_pde.hard.no_execute :
+			!info.m_entries.m_pte.hard.no_execute;
+		if ( !page_executable || address < 8 )
+			return false;
+
+		unsigned char pre_bytes[ 7 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( address - 7 ), sizeof( pre_bytes ), pre_bytes, &copied ) )
+			return false;
+
+		if ( pre_bytes[ 2 ] == 0xE8 )
+			return true;
+		if ( pre_bytes[ 1 ] == 0xFF && ( pre_bytes[ 2 ] & 0x38 ) == 0x10 )
+			return true;
+		if ( pre_bytes[ 5 ] == 0xFF && ( pre_bytes[ 6 ] & 0xF8 ) == 0xD0 )
+			return true;
+		if ( ( pre_bytes[ 4 ] & 0xF0 ) == 0x40 && pre_bytes[ 5 ] == 0xFF && ( pre_bytes[ 6 ] & 0xF8 ) == 0xD0 )
+			return true;
+
+		return false;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
@@ -478,6 +629,25 @@ namespace execution::processor {
 			add_address_classification_detection( command, sample_source_name( sample->m_source ), sample->m_processor, sample->m_rip, info, false );
 			if ( command->m_total_detection_count != before )
 				sample_detections++;
+
+			for ( auto frame_idx = 0ul; frame_idx < sample->m_frame_count; frame_idx++ ) {
+				auto candidate = sample->m_frames[ frame_idx ];
+				if ( !candidate || candidate == sample->m_rip )
+					continue;
+
+				address_info_t frame_info{ };
+				query_address_info( modules, candidate, &frame_info );
+				if ( !is_probable_return_site( candidate, frame_info ) )
+					continue;
+
+				if ( should_track_repeated_region( frame_info ) )
+					record_region( repeated_regions, repeated_counts, ARRAYSIZE( repeated_regions ), candidate );
+
+				before = command->m_total_detection_count;
+				add_address_classification_detection( command, "nmi_stack_frame", sample->m_processor, candidate, frame_info, true );
+				if ( command->m_total_detection_count != before )
+					sample_detections++;
+			}
 		}
 
 		auto stack_detections = scan_stack_frames(

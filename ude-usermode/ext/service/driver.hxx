@@ -20,9 +20,33 @@ namespace service {
 			std::uint64_t m_ki_wait_always;
 			std::uint64_t m_kd_debugger_not_present;
 			std::uint64_t m_kd_pitch_debugger;
+			std::uint64_t m_psp_create_process_notify_routine;
+			std::uint64_t m_psp_create_thread_notify_routine;
+			std::uint64_t m_psp_load_image_notify_routine;
+			std::uint64_t m_cm_callback_list_head;
+			std::uint64_t m_ke_service_descriptor_table;
+			std::uint64_t m_ke_service_descriptor_table_shadow;
+			std::uint64_t m_mm_pfn_database;
+			std::uint64_t m_etw_threat_int_prov_reg_handle;
+			std::uint64_t m_hal_send_nmi;
+			std::uint64_t m_ci_kernel_hash_bucket_list;
+			std::uint64_t m_ci_hash_cache_lock;
+			std::uint64_t m_flt_globals;
+			std::uint64_t m_ndis_global_filter_list;
 		} m_pdb;
 
 		struct offsets_t {
+			std::uint64_t m_kprcb_timer_table;
+			std::uint64_t m_kprcb_dpc_data;
+			std::uint64_t m_kthread_previous_mode;
+			std::uint64_t m_kthread_misc_flags;
+			std::uint64_t m_kthread_apc_state;
+			std::uint64_t m_kthread_start_address;
+			std::uint64_t m_kthread_win32_start_address;
+			std::uint64_t m_object_type_callback_list;
+			std::uint64_t m_mmpfn_size;
+			std::uint64_t m_mmpfn_pte_address;
+			std::uint64_t m_mmpfn_u4;
 		} m_offsets;
 
 		std::uint64_t m_image_base;
@@ -30,6 +54,7 @@ namespace service {
 		std::uint64_t m_ntoskrnl_base;
 		std::uint64_t m_directory_table_base;
 	};
+	static_assert( sizeof( driver_config_t ) == 360, "driver_config_t layout must match entry_t" );
 
 	class c_service {
 	public:
@@ -302,6 +327,47 @@ namespace service {
 			config.m_pdb.m_ki_wait_always = g_pdb->get_symbol_address( obf( "KiWaitAlways" ) );
 			config.m_pdb.m_kd_debugger_not_present = g_pdb->get_symbol_address( obf( "KdDebuggerNotPresent" ) );
 			config.m_pdb.m_kd_pitch_debugger = g_pdb->get_symbol_address( obf( "KdPitchDebugger" ) );
+			config.m_pdb.m_psp_create_process_notify_routine = g_pdb->get_symbol_address( obf( "PspCreateProcessNotifyRoutine" ) );
+			config.m_pdb.m_psp_create_thread_notify_routine = g_pdb->get_symbol_address( obf( "PspCreateThreadNotifyRoutine" ) );
+			config.m_pdb.m_psp_load_image_notify_routine = g_pdb->get_symbol_address( obf( "PspLoadImageNotifyRoutine" ) );
+			config.m_pdb.m_cm_callback_list_head = g_pdb->get_symbol_address( obf( "CmCallbackListHead" ) );
+			config.m_pdb.m_ke_service_descriptor_table = g_pdb->get_symbol_address( obf( "KeServiceDescriptorTable" ) );
+			config.m_pdb.m_ke_service_descriptor_table_shadow = g_pdb->get_symbol_address( obf( "KeServiceDescriptorTableShadow" ) );
+			config.m_pdb.m_mm_pfn_database = g_pdb->get_symbol_address( obf( "MmPfnDatabase" ) );
+			config.m_pdb.m_etw_threat_int_prov_reg_handle = g_pdb->get_symbol_address( obf( "EtwThreatIntProvRegHandle" ) );
+			config.m_pdb.m_hal_send_nmi = g_pdb->get_symbol_address( obf( "HalSendNMI" ) );
+
+			config.m_offsets.m_kprcb_timer_table = g_pdb->get_struct_member( obf( "_KPRCB" ), obf( "TimerTable" ) );
+			config.m_offsets.m_kprcb_dpc_data = g_pdb->get_struct_member( obf( "_KPRCB" ), obf( "DpcData" ) );
+			config.m_offsets.m_kthread_previous_mode = g_pdb->get_struct_member( obf( "_KTHREAD" ), obf( "PreviousMode" ) );
+			config.m_offsets.m_kthread_misc_flags = g_pdb->get_struct_member( obf( "_KTHREAD" ), obf( "MiscFlags" ) );
+			config.m_offsets.m_kthread_apc_state = g_pdb->get_struct_member( obf( "_KTHREAD" ), obf( "ApcState" ) );
+			config.m_offsets.m_kthread_start_address = g_pdb->get_struct_member( obf( "_ETHREAD" ), obf( "StartAddress" ) );
+			if ( !config.m_offsets.m_kthread_start_address )
+				config.m_offsets.m_kthread_start_address = g_pdb->get_struct_member( obf( "_KTHREAD" ), obf( "StartAddress" ) );
+			config.m_offsets.m_kthread_win32_start_address = g_pdb->get_struct_member( obf( "_ETHREAD" ), obf( "Win32StartAddress" ) );
+			config.m_offsets.m_object_type_callback_list = g_pdb->get_struct_member( obf( "_OBJECT_TYPE" ), obf( "CallbackList" ) );
+			config.m_offsets.m_mmpfn_size = g_pdb->get_struct_size( obf( "_MMPFN" ) );
+			config.m_offsets.m_mmpfn_pte_address = g_pdb->get_struct_member( obf( "_MMPFN" ), obf( "PteAddress" ) );
+			config.m_offsets.m_mmpfn_u4 = g_pdb->get_struct_member( obf( "_MMPFN" ), obf( "u4" ) );
+
+			{
+				pdb::c_pdb ci_pdb( obf( "CI.dll" ) );
+				if ( ci_pdb.load( ) ) {
+					config.m_pdb.m_ci_kernel_hash_bucket_list = ci_pdb.get_symbol_address( obf( "g_KernelHashBucketList" ) );
+					config.m_pdb.m_ci_hash_cache_lock = ci_pdb.get_symbol_address( obf( "g_HashCacheLock" ) );
+				}
+			}
+			{
+				pdb::c_pdb flt_pdb( obf( "drivers\\FLTMGR.SYS" ) );
+				if ( flt_pdb.load( ) )
+					config.m_pdb.m_flt_globals = flt_pdb.get_symbol_address( obf( "FltGlobals" ) );
+			}
+			{
+				pdb::c_pdb ndis_pdb( obf( "drivers\\ndis.sys" ) );
+				if ( ndis_pdb.load( ) )
+					config.m_pdb.m_ndis_global_filter_list = ndis_pdb.get_symbol_address( obf( "ndisGlobalFilterList" ) );
+			}
 
 			HKEY service_key = nullptr;
 			auto key_path = std::wstring( obf( L"SYSTEM\\CurrentControlSet\\Services\\" ) ) + service_name;

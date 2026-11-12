@@ -285,6 +285,171 @@ namespace service_integrity::hal {
 	}
 }
 
+namespace service_integrity::ssdt {
+	struct kservice_table_descriptor_t {
+		const long* m_service_table_base;
+		const void* m_service_counter_table_base;
+		unsigned long long m_number_of_services;
+		const unsigned char* m_param_table_base;
+	};
+
+	unsigned long scan_descriptor(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const system_module_t* expected_module,
+		unsigned long long descriptor_va,
+		const char* table_label ) {
+		if ( !command || !modules || !expected_module || !descriptor_va || !memory::is_canonical_kernel_address( descriptor_va ) )
+			return 0;
+
+		kservice_table_descriptor_t descriptor{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( descriptor_va ), sizeof( descriptor ), &descriptor, &copied ) )
+			return 0;
+
+		auto table_base = reinterpret_cast< unsigned long long >( descriptor.m_service_table_base );
+		auto count = static_cast< unsigned long >( descriptor.m_number_of_services );
+		if ( !table_base || !memory::is_canonical_kernel_address( table_base ) || count < 64 || count > 2048 )
+			return 0;
+
+		auto offsets = memory::allocate_pool< long* >( count * sizeof( long ), 1 );
+		if ( !offsets )
+			return 0;
+
+		memset( offsets, 0, count * sizeof( long ) );
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( table_base ), count * sizeof( long ), offsets, &copied ) ) {
+			memory::free_pool( offsets );
+			return 0;
+		}
+
+		unsigned long detections = 0;
+		for ( auto index = 0ul; index < count; index++ ) {
+			auto delta = static_cast< long long >( offsets[ index ] ) >> 4;
+			auto routine = static_cast< unsigned long long >( static_cast< long long >( table_base ) + delta );
+			if ( !memory::is_canonical_kernel_address( routine ) )
+				continue;
+
+			command->m_signature_candidates++;
+			target_info_t info{ };
+			query_target_info( modules, routine, &info );
+
+			bool inline_hooked = false;
+			unsigned long long hook_target = 0;
+			unsigned char prologue[ 16 ]{ };
+			if ( memory::copy_kernel_memory( reinterpret_cast< void* >( routine ), sizeof( prologue ), prologue, &copied ) ) {
+				signatures::relative_branch_signature_t rel_sig{ };
+				if ( ( prologue[ 0 ] == 0xE9 || prologue[ 0 ] == 0xEB ) &&
+					signatures::match_relative_branch_signature( prologue, sizeof( prologue ), 0, routine, &rel_sig ) &&
+					detections::is_suspicious_external_target( modules, expected_module, rel_sig.m_target ) ) {
+					inline_hooked = true;
+					hook_target = rel_sig.m_target;
+				}
+				else if ( prologue[ 0 ] == 0x48 && prologue[ 1 ] == 0xB8 && prologue[ 10 ] == 0xFF && prologue[ 11 ] == 0xE0 ) {
+					memcpy( &hook_target, prologue + 2, sizeof( hook_target ) );
+					if ( detections::is_suspicious_external_target( modules, expected_module, hook_target ) )
+						inline_hooked = true;
+				}
+			}
+
+			if ( info.m_module == expected_module && info.m_executable && !info.m_bad_backing && !inline_hooked )
+				continue;
+
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "%s[%lu]", table_label ? table_label : "SSDT", index );
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"syscall=%lu target=0x%llx owner=%s section=%s hooked=%u hook_dst=0x%llx",
+				index,
+				routine,
+				info.m_owner ? info.m_owner : "unknown",
+				info.m_section[ 0 ] ? info.m_section : "unknown",
+				inline_hooked ? 1ul : 0ul,
+				hook_target
+			);
+
+			report::add_memory_detection(
+				command,
+				target,
+				report::m_ssdt_target_violation,
+				detail,
+				routine,
+				sizeof( void* )
+			);
+			detections++;
+		}
+
+		memory::free_pool( offsets );
+		return detections;
+	}
+
+	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* nt_module ) {
+		if ( !command || !modules || !nt_module )
+			return 0;
+
+		return scan_descriptor( command, modules, nt_module, m_entry.m_pdb.m_ke_service_descriptor_table, "KeServiceDescriptorTable" );
+	}
+}
+
+namespace service_integrity::etw {
+	unsigned long scan( ioctl::command_t* command ) {
+		auto reg_handle_va = m_entry.m_pdb.m_etw_threat_int_prov_reg_handle;
+		if ( !command || !reg_handle_va || !memory::is_canonical_kernel_address( reg_handle_va ) )
+			return 0;
+
+		unsigned long long reg_entry = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( reg_handle_va ), sizeof( reg_entry ), &reg_entry, &copied ) )
+			return 0;
+
+		command->m_signature_candidates++;
+		if ( !reg_entry || !memory::is_canonical_kernel_address( reg_entry ) ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"EtwThreatIntProvRegHandle=0x%llx value=0x%llx reason=etw_ti_handle_blinded",
+				reg_handle_va,
+				reg_entry
+			);
+			report::add_memory_detection(
+				command,
+				"etw!ThreatIntProvider",
+				report::m_etw_ti_tampered_violation,
+				detail,
+				reg_handle_va,
+				sizeof( reg_entry )
+			);
+			return 1;
+		}
+
+		unsigned long long guid_entry = 0;
+		if ( memory::copy_kernel_memory( reinterpret_cast< void* >( reg_entry + 0x20ull ), sizeof( guid_entry ), &guid_entry, &copied ) &&
+			( !guid_entry || !memory::is_canonical_kernel_address( guid_entry ) ) ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"reg_entry=0x%llx guid_entry=0x%llx reason=etw_ti_guid_entry_corrupted",
+				reg_entry,
+				guid_entry
+			);
+			report::add_memory_detection(
+				command,
+				"etw!ThreatIntGuidEntry",
+				report::m_etw_ti_tampered_violation,
+				detail,
+				reg_entry + 0x20ull,
+				sizeof( guid_entry )
+			);
+			return 1;
+		}
+
+		return 0;
+	}
+}
+
 namespace service_integrity {
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
@@ -306,6 +471,9 @@ namespace service_integrity {
 
 		auto msr_detections = msr::scan( command, modules );
 		auto hal_detections = hal::scan( command, modules );
+		auto ssdt_detections = ssdt::scan( command, modules, nt_module );
+		auto etw_detections = etw::scan( command );
+		auto callback_detections = callback::scan_kernel_callbacks( command, modules );
 		auto routine_detections = routines::scan_nt_exports(
 			command,
 			modules,
@@ -315,19 +483,22 @@ namespace service_integrity {
 		);
 
 		utility::print(
-			"service integrity: modules=%lu service_exports=%lu msr_detections=%lu hal_detections=%lu routine_detections=%lu detections=%lu\n",
+			"service integrity: modules=%lu candidates=%lu msr=%lu hal=%lu ssdt=%lu etw=%lu callbacks=%lu routines=%lu detections=%lu\n",
 			modules->m_count,
 			command->m_signature_candidates,
 			msr_detections,
 			hal_detections,
+			ssdt_detections,
+			etw_detections,
+			callback_detections,
 			routine_detections,
 			command->m_total_detection_count
 		);
 
 		memory::free_pool( disk_image );
 		command->m_modules_scanned = modules->m_count;
-		command->m_sections_scanned = 3;
-		command->m_signature_detections = msr_detections + hal_detections + routine_detections;
+		command->m_sections_scanned = 6;
+		command->m_signature_detections = msr_detections + hal_detections + ssdt_detections + etw_detections + callback_detections + routine_detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 		return true;

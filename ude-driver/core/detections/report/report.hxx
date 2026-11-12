@@ -98,6 +98,17 @@ namespace report {
 	constexpr const char* m_hal_dispatch_target_violation = "hal dispatch table target outside trusted code";
 	constexpr const char* m_patchguard_context_violation = "patchguard or kernel debug state tampered";
 	constexpr const char* m_timer_dpc_target_violation = "kernel timer dpc target outside trusted code";
+	constexpr const char* m_kernel_callback_target_violation = "kernel notify or object callback outside trusted code";
+	constexpr const char* m_ci_hash_bucket_violation = "suspicious ci.dll kernelhashbucketlist entry";
+	constexpr const char* m_ssdt_target_violation = "ssdt service target outside kernel code or hooked";
+	constexpr const char* m_etw_ti_tampered_violation = "etw threat intelligence provider tampered";
+	constexpr const char* m_hypervisor_timing_violation = "stealth hypervisor vm-exit timing or tsc discrepancy";
+	constexpr const char* m_cpu_security_cr_violation = "processor security control register bit disabled";
+	constexpr const char* m_debug_register_violation = "active kernel hardware debug breakpoint";
+	constexpr const char* m_pfn_database_violation = "executable page pfn database metadata spoofed";
+	constexpr const char* m_physical_memory_section_violation = "suspicious physicalmemory section dacl or kuser mapping";
+	constexpr const char* m_thread_anomaly_violation = "kernel thread spoofed start address or debug state";
+	constexpr const char* m_filter_callback_violation = "filesystem or ndis filter handler outside trusted code";
 	constexpr bool m_report_generic_code_changes = false;
 
 	const char* violation_name_for_branch_signature( const char* signature_type ) {

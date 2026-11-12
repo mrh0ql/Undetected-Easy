@@ -602,11 +602,99 @@ namespace memory_scan::permissions {
 		}
 	}
 
+	void report_pfn_database_spoofing( scan_state_t* state, const page_mapping_t& mapping ) {
+		if ( !state || !state->m_command || !state->m_pfn_db_base )
+			return;
+
+		if ( !mapping.m_kernel || !mapping.m_executable || mapping.m_page_size != PAGE_SIZE || !mapping.m_pfn )
+			return;
+
+		if ( is_device_like_mapping( mapping ) )
+			return;
+
+		auto physical_address = mapping.m_pfn << page_shift;
+		if ( is_low_mmio_physical_address( physical_address ) || !is_mapping_inside_physical_ranges( state, mapping ) )
+			return;
+
+		if ( is_module_backed( state->m_modules, mapping.m_va ) )
+			return;
+
+		if ( m_entry.m_image_base && m_entry.m_image_size &&
+			mapping.m_va >= m_entry.m_image_base &&
+			mapping.m_va < m_entry.m_image_base + m_entry.m_image_size )
+			return;
+
+		auto mmpfn_size = m_entry.m_offsets.m_mmpfn_size ? m_entry.m_offsets.m_mmpfn_size : 0x30ull;
+		auto pte_addr_off = m_entry.m_offsets.m_mmpfn_pte_address ? m_entry.m_offsets.m_mmpfn_pte_address : 0x10ull;
+		if ( mmpfn_size < 0x28ull || mmpfn_size > 0x80ull || pte_addr_off + sizeof( unsigned long long ) > mmpfn_size )
+			return;
+
+		auto mmpfn_va = state->m_pfn_db_base + ( mapping.m_pfn * mmpfn_size );
+		if ( !memory::is_canonical_kernel_address( mmpfn_va ) )
+			return;
+
+		unsigned char mmpfn_bytes[ 0x80 ]{ };
+		if ( !copy_virtual( mmpfn_va, mmpfn_bytes, static_cast< size_t >( mmpfn_size ) ) )
+			return;
+
+		unsigned long long pfn_pte_va = 0;
+		memcpy( &pfn_pte_va, mmpfn_bytes + pte_addr_off, sizeof( pfn_pte_va ) );
+
+		auto expected_pte_va = state->m_has_self_ref_pml4
+			? canonicalize_va(
+				( static_cast< unsigned long long >( state->m_self_ref_pml4_index ) << 39 ) |
+				( ( mapping.m_va & 0x0000fffffffff000ull ) >> 9 ) )
+			: 0ull;
+
+		const char* reason = nullptr;
+		if ( pfn_pte_va == 0 ) {
+			reason = "mmpfn_pte_address_wiped";
+		}
+		else if ( state->m_has_self_ref_pml4 &&
+			memory::is_canonical_kernel_address( pfn_pte_va ) &&
+			( ( pfn_pte_va >> 39 ) & 0x1ffull ) == state->m_self_ref_pml4_index &&
+			pfn_pte_va != expected_pte_va ) {
+			reason = "mmpfn_pte_mismatch";
+		}
+		else if ( memory::is_canonical_kernel_address( m_entry.m_pdb.m_mi_is_page_on_bad_list ) ) {
+			using mi_is_page_on_bad_list_t = unsigned char( __fastcall* )( void* );
+			auto is_bad = reinterpret_cast< mi_is_page_on_bad_list_t >( m_entry.m_pdb.m_mi_is_page_on_bad_list );
+			if ( is_bad( reinterpret_cast< void* >( mmpfn_va ) ) != 0 )
+				reason = "mmpfn_on_bad_page_list";
+		}
+
+		if ( !reason )
+			return;
+
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"reason=%s va=0x%llx pfn=0x%llx pfn_pte=0x%llx expected_pte=0x%llx",
+			reason,
+			mapping.m_va,
+			mapping.m_pfn,
+			pfn_pte_va,
+			expected_pte_va
+		);
+
+		report::add_memory_detection(
+			state->m_command,
+			"memory!mmpfn",
+			report::m_pfn_database_violation,
+			detail,
+			mapping.m_va,
+			mapping.m_page_size
+		);
+		state->m_pfn_db_detections++;
+	}
+
 	void inspect( scan_state_t* state, const page_mapping_t& mapping ) {
 		track_executable_region( state, mapping );
 		report_pfn_outside_ranges( state, mapping );
 		report_physical_address_disagreement( state, mapping );
 		report_kernel_user_page( state, mapping );
+		report_pfn_database_spoofing( state, mapping );
 	}
 }
 

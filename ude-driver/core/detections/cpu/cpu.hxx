@@ -146,6 +146,169 @@ namespace cpu_integrity {
 		return detections;
 	}
 
+	unsigned long scan_control_registers( ioctl::command_t* command, unsigned long proc_index ) {
+		unsigned long detections = 0;
+
+		const auto cr0 = __readcr0( );
+		if ( ( cr0 & ( 1ull << 16 ) ) == 0 ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( detail, sizeof( detail ), "cpu=%lu cr0=0x%llx reason=cr0_wp_disabled", proc_index, cr0 );
+			report::add_memory_detection( command, "cpu!cr0", report::m_cpu_security_cr_violation, detail, proc_index, sizeof( cr0 ) );
+			detections++;
+		}
+
+		int leaf7[ 4 ]{ };
+		__cpuidex( leaf7, 7, 0 );
+		const bool smep_supported = ( leaf7[ 1 ] & ( 1 << 7 ) ) != 0;
+		const auto cr4 = __readcr4( );
+		if ( smep_supported && ( cr4 & ( 1ull << 20 ) ) == 0 ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( detail, sizeof( detail ), "cpu=%lu cr4=0x%llx reason=cr4_smep_disabled", proc_index, cr4 );
+			report::add_memory_detection( command, "cpu!cr4", report::m_cpu_security_cr_violation, detail, proc_index, sizeof( cr4 ) );
+			detections++;
+		}
+
+		const auto efer = __readmsr( 0xC0000080ul );
+		if ( ( efer & ( 1ull << 11 ) ) == 0 ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( detail, sizeof( detail ), "cpu=%lu ia32_efer=0x%llx reason=efer_nxe_disabled", proc_index, efer );
+			report::add_memory_detection( command, "cpu!efer", report::m_cpu_security_cr_violation, detail, proc_index, sizeof( efer ) );
+			detections++;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_debug_registers( ioctl::command_t* command, unsigned long proc_index ) {
+		if ( SharedUserData->KdDebuggerEnabled )
+			return 0;
+
+		const auto dr0 = __readdr( 0 );
+		const auto dr1 = __readdr( 1 );
+		const auto dr2 = __readdr( 2 );
+		const auto dr3 = __readdr( 3 );
+		const auto dr7 = __readdr( 7 );
+
+		const unsigned long long dr_regs[ 4 ] = { dr0, dr1, dr2, dr3 };
+		unsigned long detections = 0;
+
+		for ( auto bp = 0ul; bp < 4ul; bp++ ) {
+			const bool local_en = ( dr7 & ( 1ull << ( bp * 2 ) ) ) != 0;
+			const bool global_en = ( dr7 & ( 1ull << ( bp * 2 + 1 ) ) ) != 0;
+			if ( !global_en && !( local_en && memory::is_canonical_kernel_address( dr_regs[ bp ] ) ) )
+				continue;
+
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"cpu=%lu dr%lu=0x%llx dr7=0x%llx global=%u",
+				proc_index,
+				bp,
+				dr_regs[ bp ],
+				dr7,
+				global_en ? 1ul : 0ul
+			);
+			report::add_memory_detection(
+				command,
+				"cpu!debug_registers",
+				report::m_debug_register_violation,
+				detail,
+				dr_regs[ bp ] ? dr_regs[ bp ] : proc_index,
+				sizeof( void* )
+			);
+			detections++;
+		}
+
+		return detections;
+	}
+
+	bool safe_read_aperf( unsigned long long* value ) {
+		if ( !value )
+			return false;
+		__try {
+			*value = __readmsr( 0xE8ul );
+			return true;
+		}
+		__except ( EXCEPTION_EXECUTE_HANDLER ) {
+			*value = 0;
+			return false;
+		}
+	}
+
+	unsigned long scan_hypervisor_timing( ioctl::command_t* command, unsigned long proc_index ) {
+		int leaf1[ 4 ]{ };
+		__cpuid( leaf1, 1 );
+		const bool hypervisor_bit = ( leaf1[ 2 ] & ( 1 << 31 ) ) != 0;
+
+		int leaf6[ 4 ]{ };
+		__cpuid( leaf6, 6 );
+		const bool has_aperf = ( leaf6[ 2 ] & 1 ) != 0;
+
+		KIRQL old_irql = PASSIVE_LEVEL;
+		KeRaiseIrql( HIGH_LEVEL, &old_irql );
+
+		unsigned int aux = 0;
+		unsigned long long min_cpuid_cycles = ~0ull;
+		bool tsc_rewound = false;
+
+		unsigned long long aperf_start = 0;
+		unsigned long long aperf_end = 0;
+		const bool aperf_ok_start = has_aperf && safe_read_aperf( &aperf_start );
+		const auto total_tsc_start = __rdtscp( &aux );
+
+		for ( auto sample = 0ul; sample < 32ul; sample++ ) {
+			int dummy[ 4 ]{ };
+			const auto t0 = __rdtscp( &aux );
+			__cpuid( dummy, 1 );
+			const auto t1 = __rdtscp( &aux );
+
+			if ( t1 <= t0 || ( t1 - t0 ) > ( 1ull << 40 ) ) {
+				tsc_rewound = true;
+				break;
+			}
+
+			const auto delta = t1 - t0;
+			if ( delta < min_cpuid_cycles )
+				min_cpuid_cycles = delta;
+		}
+
+		const auto total_tsc_end = __rdtscp( &aux );
+		const bool aperf_ok_end = aperf_ok_start && safe_read_aperf( &aperf_end );
+
+		KeLowerIrql( old_irql );
+
+		const auto total_tsc_delta = total_tsc_end > total_tsc_start ? ( total_tsc_end - total_tsc_start ) : 0ull;
+		const auto total_aperf_delta = ( aperf_ok_end && aperf_end >= aperf_start ) ? ( aperf_end - aperf_start ) : 0ull;
+		const bool aperf_skew = aperf_ok_end && total_tsc_delta > 0 && total_aperf_delta > total_tsc_delta * 16ull;
+		const bool hidden_vmexit_latency = !hypervisor_bit && min_cpuid_cycles > 1600ull && min_cpuid_cycles != ~0ull;
+
+		if ( !tsc_rewound && !aperf_skew && !hidden_vmexit_latency )
+			return 0;
+
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"cpu=%lu hv_bit=%u min_cpuid_tsc=%llu total_tsc=%llu aperf=%llu rewound=%u",
+			proc_index,
+			hypervisor_bit ? 1ul : 0ul,
+			min_cpuid_cycles == ~0ull ? 0ull : min_cpuid_cycles,
+			total_tsc_delta,
+			total_aperf_delta,
+			tsc_rewound ? 1ul : 0ul
+		);
+		report::add_memory_detection(
+			command,
+			"cpu!hypervisor_timing",
+			report::m_hypervisor_timing_violation,
+			detail,
+			proc_index,
+			sizeof( unsigned long long )
+		);
+		return 1;
+	}
+
 	unsigned long scan_all_processors( ioctl::command_t* command, const system_modules_t* modules, unsigned long* total_idt_entries ) {
 		if ( total_idt_entries )
 			*total_idt_entries = 0;
@@ -172,6 +335,9 @@ namespace cpu_integrity {
 				if ( total_idt_entries )
 					*total_idt_entries += command->m_sections_scanned;
 				detections += scan_msrs( command, modules );
+				detections += scan_control_registers( command, proc_index );
+				detections += scan_debug_registers( command, proc_index );
+				detections += scan_hypervisor_timing( command, proc_index );
 
 				KeRevertToUserGroupAffinityThread( &previous_affinity );
 			}
@@ -181,6 +347,9 @@ namespace cpu_integrity {
 				if ( total_idt_entries )
 					*total_idt_entries += command->m_sections_scanned;
 				detections += scan_msrs( command, modules );
+				detections += scan_control_registers( command, 0 );
+				detections += scan_debug_registers( command, 0 );
+				detections += scan_hypervisor_timing( command, 0 );
 			}
 		}
 

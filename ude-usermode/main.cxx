@@ -98,11 +98,20 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "stack pointer" ) || contains_insensitive( type, "stack owner chain" ) || contains_insensitive( type, "stack frame" ) )
 		return obf( "we detected stack pivots and synthetic frames; keep normal call flow and unwindable frames inside trusted executable code." );
 
+	if ( contains_insensitive( type, "spoofed start address" ) )
+		return obf( "we detected a system thread with a spoofed _ETHREAD.StartAddress or active debug state; create threads legitimately inside signed module code without tampering ETHREAD fields." );
+
 	if ( contains_insensitive( type, "thread start" ) )
 		return obf( "we detected bad system threads; do not execute from outside executable sections or any memory outside of loaded modules." );
 
+	if ( contains_insensitive( type, "physicalmemory section" ) || contains_insensitive( type, "kuser mapping" ) )
+		return obf( "we detected a permissive \\Device\\PhysicalMemory DACL or writable/executable KUSER_SHARED_DATA PTE; restore default kernel security descriptors and read-only NX mappings." );
+
 	if ( contains_insensitive( type, "kernel page mapped user" ) || contains_insensitive( type, "mapped into process" ) || contains_insensitive( type, "physical memory window" ) )
 		return obf( "we detected kernel or physical memory mapped into user processes; keep kernel or physical memory outside of the process." );
+
+	if ( contains_insensitive( type, "pfn database metadata" ) )
+		return obf( "we detected spoofed MmPfnDatabase metadata (wiped _MMPFN.PteAddress, MiMakePageBad, or shadow PTE mismatch); do not wipe PFN entries or alias unbacked executable pages." );
 
 	if ( contains_insensitive( type, "same pfn" ) || contains_insensitive( type, "page pfn" ) || contains_insensitive( type, "page walk" ) || contains_insensitive( type, "pml4" ) || contains_insensitive( type, "page table" ) )
 		return obf( "we detected modified page tables; keep physical mappings consistent." );
@@ -116,17 +125,41 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "loaded module list entry" ) )
 		return obf( "we detected a loaded-module entry that does not line up with a normal driver image/object; load the driver through the normal service path." );
 
+	if ( contains_insensitive( type, "kernelhashbucketlist" ) )
+		return obf( "we detected a blocked or tampered driver entry in CI.dll!g_KernelHashBucketList; clear vulnerable driver load traces without leaving zeroed hash buckets." );
+
 	if ( contains_insensitive( type, "blocklist" ) || contains_insensitive( type, "vulnerable driver" ) )
-		return obf( "we detected a vulnerable driver on Microsoft's blocklist; unload it and clear its traces from PiDDBCacheTable and MmUnloadedDrivers." );
+		return obf( "we detected a vulnerable driver on Microsoft's blocklist; unload it and clear its traces from PiDDBCacheTable, MmUnloadedDrivers, and CI.dll!g_KernelHashBucketList." );
 
 	if ( contains_insensitive( type, "piddbcachetable" ) || contains_insensitive( type, "mmunloadeddrivers" ) )
 		return obf( "we detected driver load history traces or malformed entries in PiDDBCacheTable / MmUnloadedDrivers; sanitize the entry while preserving valid list links and timestamps." );
+
+	if ( contains_insensitive( type, "kernel notify" ) || contains_insensitive( type, "object callback" ) )
+		return obf( "we detected a process/thread/image notify routine, registry callback, or ObRegisterCallbacks handler pointing outside signed modules; register callbacks only inside backed driver code." );
+
+	if ( contains_insensitive( type, "filter handler" ) )
+		return obf( "we detected an unbacked filesystem, PCI, or NDIS filter device/handler attached to a kernel stack; detach unauthorized filter devices and restore backed dispatch routines." );
+
+	if ( contains_insensitive( type, "etw threat intelligence" ) )
+		return obf( "we detected tampering or blinding on EtwThreatIntProvRegHandle; restore the intact ETW Threat Intelligence registration state." );
+
+	if ( contains_insensitive( type, "ssdt" ) )
+		return obf( "we detected an SSDT entry pointing outside ntoskrnl or patched with an inline hook; restore unmodified KeServiceDescriptorTable routines." );
 
 	if ( contains_insensitive( type, "hal dispatch" ) )
 		return obf( "we detected a modified HalDispatchTable or HalPrivateDispatchTable pointer; restore all HAL dispatch pointers to trusted system modules." );
 
 	if ( contains_insensitive( type, "patchguard" ) || contains_insensitive( type, "kernel debug" ) )
 		return obf( "we detected PatchGuard or kernel debugger state tampering (KdDebuggerNotPresent / KeBugCheckEx / timer keys); restore unmodified kernel state." );
+
+	if ( contains_insensitive( type, "security control register" ) )
+		return obf( "we detected disabled CPU security bits (CR0.WP, CR4.SMEP, or IA32_EFER.NXE); keep hardware write-protect, SMEP, and NX protections enabled across all cores." );
+
+	if ( contains_insensitive( type, "hardware debug breakpoint" ) )
+		return obf( "we detected active kernel hardware debug registers (DR0-DR3 / DR7); clear hardware breakpoints on all logical processors." );
+
+	if ( contains_insensitive( type, "hypervisor" ) || contains_insensitive( type, "tsc discrepancy" ) )
+		return obf( "we detected stealth hypervisor VM-exit timing inflation or TSC/IA32_APERF offsetting skew; ensure accurate TSC scaling and MPPERF/APERF passthrough." );
 
 	if ( contains_insensitive( type, "dispatch" ) || contains_insensitive( type, "device object" ) || contains_insensitive( type, "driver object" ) )
 		return obf( "we detected modified driver/device objects; keep dispatch pointers inside the owning driver's executable sections." );

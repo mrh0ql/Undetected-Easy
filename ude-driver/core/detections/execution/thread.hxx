@@ -133,6 +133,93 @@ namespace execution::thread {
 		return ( translated && api_physical && translated != api_physical ) || flags;
 	}
 
+	unsigned long inspect_ethread_anomalies(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		HANDLE pid,
+		HANDLE tid,
+		unsigned long long query_start ) {
+		if ( !command || !modules || !tid )
+			return 0;
+
+		PETHREAD ethread = nullptr;
+		if ( !NT_SUCCESS( PsLookupThreadByThreadId( tid, &ethread ) ) || !ethread )
+			return 0;
+
+		unsigned long detections = 0;
+		const auto thread_va = reinterpret_cast< unsigned long long >( ethread );
+		const auto is_system_thread = PsIsSystemThread( ethread ) != FALSE;
+
+		unsigned char dispatcher_header[ 4 ]{ };
+		size_t copied = 0;
+		if ( is_system_thread &&
+			memory::copy_kernel_memory( ethread, sizeof( dispatcher_header ), dispatcher_header, &copied ) &&
+			( dispatcher_header[ 3 ] & 0x01u ) != 0 &&
+			!SharedUserData->KdDebuggerEnabled ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"pid=0x%llx tid=0x%llx ethread=0x%llx debug_active=0x%x reason=system_thread_active_dr7",
+				reinterpret_cast< unsigned long long >( pid ),
+				reinterpret_cast< unsigned long long >( tid ),
+				thread_va,
+				static_cast< unsigned long >( dispatcher_header[ 3 ] )
+			);
+			auto before = command->m_total_detection_count;
+			report::add_execution_detection(
+				command,
+				"thread!debug_active",
+				report::m_debug_register_violation,
+				detail,
+				thread_va,
+				sizeof( void* )
+			);
+			if ( command->m_total_detection_count != before )
+				detections++;
+		}
+
+		if ( is_system_thread && m_entry.m_offsets.m_kthread_start_address && m_entry.m_offsets.m_kthread_start_address < 0x1000 ) {
+			unsigned long long internal_start = 0;
+			if ( memory::copy_kernel_memory(
+				reinterpret_cast< void* >( thread_va + m_entry.m_offsets.m_kthread_start_address ),
+				sizeof( internal_start ),
+				&internal_start,
+				&copied ) &&
+				internal_start && memory::is_canonical_kernel_address( internal_start ) ) {
+				char section[ 9 ]{ };
+				auto owner_module = module::disk::find_module_by_address( modules, internal_start );
+				auto executable = owner_module && module::disk::is_address_in_executable_section( owner_module, internal_start, section, sizeof( section ) );
+				if ( !owner_module || !executable ) {
+					char detail[ ioctl::m_detection_text_size ]{ };
+					RtlStringCbPrintfA(
+						detail,
+						sizeof( detail ),
+						"pid=0x%llx tid=0x%llx ethread_start=0x%llx query_start=0x%llx reason=unbacked_ethread_start",
+						reinterpret_cast< unsigned long long >( pid ),
+						reinterpret_cast< unsigned long long >( tid ),
+						internal_start,
+						query_start
+					);
+					auto before = command->m_total_detection_count;
+					report::add_execution_detection(
+						command,
+						"thread!start_address",
+						report::m_thread_anomaly_violation,
+						detail,
+						internal_start,
+						sizeof( void* )
+					);
+					if ( command->m_total_detection_count != before )
+						detections++;
+				}
+			}
+		}
+
+		ObDereferenceObject( ethread );
+		return detections;
+	}
+
 	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return 0;
@@ -148,6 +235,14 @@ namespace execution::thread {
 			auto threads = reinterpret_cast< system_thread_information_t* >( process + 1 );
 			for ( auto index = 0ul; index < process->m_thread_count; index++ ) {
 				auto start = reinterpret_cast< unsigned long long >( threads[ index ].m_start_address );
+				detections += inspect_ethread_anomalies(
+					command,
+					modules,
+					process->m_process_id,
+					threads[ index ].m_client_id.UniqueThread,
+					start
+				);
+
 				if ( !start || !memory::is_canonical_kernel_address( start ) )
 					continue;
 

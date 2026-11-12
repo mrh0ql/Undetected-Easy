@@ -467,6 +467,262 @@ namespace callback {
 		return seed_loaded_drivers( );
 	}
 
+	struct ex_callback_routine_block_t {
+		EX_RUNDOWN_REF m_rundown_protect;
+		void* m_function;
+		void* m_context;
+	};
+
+	struct ob_callback_entry_item_t {
+		LIST_ENTRY m_entry_item_list;
+		OB_OPERATION m_operations;
+		ULONG m_active;
+		void* m_callback_entry;
+		POBJECT_TYPE m_object_type;
+		void* m_pre_operation;
+		void* m_post_operation;
+		EX_RUNDOWN_REF m_rundown_protection;
+	};
+
+	inline unsigned long validate_callback_target(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const char* table_name,
+		unsigned long slot_index,
+		unsigned long long routine ) {
+		if ( !command || !modules || !routine )
+			return 0;
+
+		if ( !memory::is_canonical_kernel_address( routine ) ) {
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "callback!%s[%lu]", table_name ? table_name : "notify", slot_index );
+			RtlStringCbPrintfA( detail, sizeof( detail ), "table=%s slot=%lu target=0x%llx reason=non_canonical_target", table_name ? table_name : "notify", slot_index, routine );
+			report::add_memory_detection( command, target, report::m_kernel_callback_target_violation, detail, routine, sizeof( void* ) );
+			return 1;
+		}
+
+		command->m_signature_candidates++;
+
+		char section[ 9 ]{ };
+		auto owner_mod = module::disk::find_module_by_address( modules, routine );
+		const char* owner = owner_mod
+			? reinterpret_cast< const char* >( owner_mod->m_full_path_name ) + owner_mod->m_offset_to_file_name
+			: nullptr;
+		auto executable = owner_mod && module::disk::is_address_in_executable_section( owner_mod, routine, section, sizeof( section ) );
+
+		bool bad_backing = false;
+		unsigned long long pfn = 0;
+		paging::pt_entries_t entries{ };
+		if ( paging::hyperspace_entries( entries, routine ) ) {
+			pfn = entries.m_pdpte.hard.page_size ? entries.m_pdpte.hard.pfn :
+				entries.m_pde.hard.page_size ? entries.m_pde.hard.pfn :
+				entries.m_pte.hard.pfn;
+			auto user_page = entries.m_pdpte.hard.page_size ? entries.m_pdpte.hard.user_supervisor :
+				entries.m_pde.hard.page_size ? entries.m_pde.hard.user_supervisor :
+				entries.m_pte.hard.user_supervisor;
+			auto nx_page = entries.m_pdpte.hard.page_size ? entries.m_pdpte.hard.no_execute :
+				entries.m_pde.hard.page_size ? entries.m_pde.hard.no_execute :
+				entries.m_pte.hard.no_execute;
+
+			std::uint32_t page_size = 0;
+			unsigned long long walk_pa = 0;
+			paging::translate_linear( routine, &walk_pa, &page_size );
+			auto api_pa = static_cast< unsigned long long >( MmGetPhysicalAddress( reinterpret_cast< void* >( routine ) ).QuadPart );
+			bad_backing = ( walk_pa && api_pa && walk_pa != api_pa ) || user_page || nx_page;
+		}
+
+		if ( owner_mod && executable && !bad_backing )
+			return 0;
+
+		char target[ ioctl::m_detection_target_size ]{ };
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA( target, sizeof( target ), "callback!%s[%lu]", table_name ? table_name : "notify", slot_index );
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"table=%s slot=%lu target=0x%llx owner=%s section=%s pfn=0x%llx bad_pfn=%u",
+			table_name ? table_name : "notify",
+			slot_index,
+			routine,
+			owner ? owner : "unknown",
+			section[ 0 ] ? section : "unknown",
+			pfn,
+			bad_backing ? 1ul : 0ul
+		);
+
+		report::add_memory_detection(
+			command,
+			target,
+			report::m_kernel_callback_target_violation,
+			detail,
+			routine,
+			sizeof( void* )
+		);
+		return 1;
+	}
+
+	inline unsigned long scan_notify_array(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long array_address,
+		const char* array_name ) {
+		if ( !command || !modules || !array_address || !memory::is_canonical_kernel_address( array_address ) )
+			return 0;
+
+		unsigned long long slots[ 64 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( array_address ), sizeof( slots ), slots, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto index = 0ul; index < 64ul; index++ ) {
+			auto block_va = slots[ index ] & ~0xfull;
+			if ( !block_va || !memory::is_canonical_kernel_address( block_va ) )
+				continue;
+
+			ex_callback_routine_block_t block{ };
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( block_va ), sizeof( block ), &block, &copied ) )
+				continue;
+
+			detections += validate_callback_target(
+				command,
+				modules,
+				array_name,
+				index,
+				reinterpret_cast< unsigned long long >( block.m_function )
+			);
+		}
+
+		return detections;
+	}
+
+	inline unsigned long scan_cm_callbacks( ioctl::command_t* command, const system_modules_t* modules ) {
+		auto head_address = m_entry.m_pdb.m_cm_callback_list_head;
+		if ( !command || !modules || !head_address || !memory::is_canonical_kernel_address( head_address ) )
+			return 0;
+
+		auto head = reinterpret_cast< LIST_ENTRY* >( head_address );
+		LIST_ENTRY head_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( head, sizeof( head_copy ), &head_copy, &copied ) )
+			return 0;
+
+		auto current = head_copy.Flink;
+		unsigned long detections = 0;
+		unsigned long walked = 0;
+
+		while ( current && current != head && walked < 256ul ) {
+			if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( current ) ) )
+				break;
+
+			unsigned char raw_block[ 0x48 ]{ };
+			if ( !memory::copy_kernel_memory( current, sizeof( raw_block ), raw_block, &copied ) )
+				break;
+
+			const auto links = reinterpret_cast< const LIST_ENTRY* >( raw_block );
+			unsigned long long function_va = 0;
+
+			auto check_altitude_at = [ & ]( size_t alt_offset ) -> bool {
+				if ( alt_offset < sizeof( void* ) || alt_offset + sizeof( UNICODE_STRING ) > sizeof( raw_block ) )
+					return false;
+				const auto alt = reinterpret_cast< const UNICODE_STRING* >( raw_block + alt_offset );
+				return alt->Length > 0 && alt->Length <= alt->MaximumLength &&
+					alt->MaximumLength <= 256 && ( alt->Length & 1 ) == 0 &&
+					memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( alt->Buffer ) );
+			};
+
+			if ( check_altitude_at( 0x30 ) )
+				memcpy( &function_va, raw_block + 0x28, sizeof( function_va ) );
+			else if ( check_altitude_at( 0x28 ) )
+				memcpy( &function_va, raw_block + 0x20, sizeof( function_va ) );
+
+			if ( function_va )
+				detections += validate_callback_target( command, modules, "CmCallbackList", walked, function_va );
+
+			current = links->Flink;
+			walked++;
+		}
+
+		return detections;
+	}
+
+	inline unsigned long scan_ob_type_callbacks(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		POBJECT_TYPE object_type,
+		const char* type_label ) {
+		auto list_offset = m_entry.m_offsets.m_object_type_callback_list;
+		if ( !command || !modules || !object_type || !list_offset || list_offset > 0x400 )
+			return 0;
+
+		auto head_va = reinterpret_cast< unsigned long long >( object_type ) + list_offset;
+		if ( !memory::is_canonical_kernel_address( head_va ) )
+			return 0;
+
+		auto head = reinterpret_cast< LIST_ENTRY* >( head_va );
+		LIST_ENTRY head_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( head, sizeof( head_copy ), &head_copy, &copied ) )
+			return 0;
+
+		auto current = head_copy.Flink;
+		unsigned long detections = 0;
+		unsigned long walked = 0;
+
+		while ( current && current != head && walked < 256ul ) {
+			if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( current ) ) )
+				break;
+
+			ob_callback_entry_item_t item{ };
+			if ( !memory::copy_kernel_memory( current, sizeof( item ), &item, &copied ) )
+				break;
+
+			if ( item.m_object_type == object_type && item.m_active ) {
+				if ( item.m_pre_operation ) {
+					detections += validate_callback_target(
+						command,
+						modules,
+						type_label,
+						walked * 2,
+						reinterpret_cast< unsigned long long >( item.m_pre_operation )
+					);
+				}
+				if ( item.m_post_operation ) {
+					detections += validate_callback_target(
+						command,
+						modules,
+						type_label,
+						walked * 2 + 1,
+						reinterpret_cast< unsigned long long >( item.m_post_operation )
+					);
+				}
+			}
+
+			current = item.m_entry_item_list.Flink;
+			walked++;
+		}
+
+		return detections;
+	}
+
+	inline unsigned long scan_kernel_callbacks( ioctl::command_t* command, const system_modules_t* modules ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		detections += scan_notify_array( command, modules, m_entry.m_pdb.m_psp_create_process_notify_routine, "PspCreateProcessNotifyRoutine" );
+		detections += scan_notify_array( command, modules, m_entry.m_pdb.m_psp_create_thread_notify_routine, "PspCreateThreadNotifyRoutine" );
+		detections += scan_notify_array( command, modules, m_entry.m_pdb.m_psp_load_image_notify_routine, "PspLoadImageNotifyRoutine" );
+		detections += scan_cm_callbacks( command, modules );
+		if ( PsProcessType && *PsProcessType )
+			detections += scan_ob_type_callbacks( command, modules, *PsProcessType, "ObProcessCallbacks" );
+		if ( PsThreadType && *PsThreadType )
+			detections += scan_ob_type_callbacks( command, modules, *PsThreadType, "ObThreadCallbacks" );
+
+		return detections;
+	}
+
 	inline void destroy( ) {
 		if ( m_image_callback_registered ) {
 			PsRemoveLoadImageNotifyRoutine( image_load_notify );

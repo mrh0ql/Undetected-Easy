@@ -238,6 +238,130 @@ namespace dpc_integrity {
 		return false;
 	}
 
+	struct ktimer_table_entry_t {
+		ULONG_PTR m_lock;
+		LIST_ENTRY m_entry;
+		ULARGE_INTEGER m_time;
+	};
+
+	struct kdpc_data_head_t {
+		SINGLE_LIST_ENTRY m_list_head;
+		SINGLE_LIST_ENTRY* m_last_entry;
+		ULONG_PTR m_dpc_lock;
+		LONG m_dpc_queue_depth;
+	};
+
+	unsigned long scan_current_prcb_queues(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long wait_never,
+		unsigned long long wait_always ) {
+		auto kpcr_self = __readgsqword( 0x18 );
+		auto prcb = __readgsqword( 0x20 );
+		if ( !prcb || !memory::is_canonical_kernel_address( prcb ) || prcb != kpcr_self + 0x180 )
+			return 0;
+
+		unsigned long detections = 0;
+		size_t copied = 0;
+
+		auto dpc_offset = m_entry.m_offsets.m_kprcb_dpc_data;
+		if ( dpc_offset && dpc_offset < 0x10000 ) {
+			for ( auto queue_idx = 0ul; queue_idx < 2ul; queue_idx++ ) {
+				kdpc_data_head_t dpc_data{ };
+				auto queue_va = prcb + dpc_offset + queue_idx * 0x28ull;
+				if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( queue_va ), sizeof( dpc_data ), &dpc_data, &copied ) )
+					continue;
+
+				auto node = dpc_data.m_list_head.Next;
+				for ( auto walked = 0ul; node && walked < 64ul; walked++ ) {
+					auto node_va = reinterpret_cast< unsigned long long >( node );
+					if ( !memory::is_canonical_kernel_address( node_va ) )
+						break;
+
+					auto dpc_va = node_va - FIELD_OFFSET( KDPC, DpcListEntry );
+					KDPC dpc_copy{ };
+					if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( dpc_va ), sizeof( dpc_copy ), &dpc_copy, &copied ) )
+						break;
+
+					if ( is_plausible_dpc( &dpc_copy ) ) {
+						command->m_signature_candidates++;
+						detections += inspect_candidate( command, modules, &dpc_copy, "prcb_dpc_queue" );
+					}
+
+					node = dpc_copy.DpcListEntry.Next;
+				}
+			}
+		}
+
+		auto timer_table_offset = m_entry.m_offsets.m_kprcb_timer_table;
+		if ( wait_never && wait_always && timer_table_offset && timer_table_offset < 0x20000 ) {
+			auto entries_base = prcb + timer_table_offset + 0x200ull;
+			for ( auto bucket = 0ul; bucket < 512ul; bucket++ ) {
+				auto bucket_va = entries_base + bucket * sizeof( ktimer_table_entry_t );
+				auto list_head_va = bucket_va + FIELD_OFFSET( ktimer_table_entry_t, m_entry );
+
+				ktimer_table_entry_t table_entry{ };
+				if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( bucket_va ), sizeof( table_entry ), &table_entry, &copied ) )
+					break;
+
+				auto flink_va = reinterpret_cast< unsigned long long >( table_entry.m_entry.Flink );
+				auto blink_va = reinterpret_cast< unsigned long long >( table_entry.m_entry.Blink );
+				if ( !memory::is_canonical_kernel_address( flink_va ) || !memory::is_canonical_kernel_address( blink_va ) )
+					break;
+
+				if ( flink_va == list_head_va )
+					continue;
+
+				LIST_ENTRY first_node{ };
+				if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( flink_va ), sizeof( first_node ), &first_node, &copied ) ||
+					reinterpret_cast< unsigned long long >( first_node.Blink ) != list_head_va )
+					continue;
+
+				auto cursor_va = flink_va;
+				for ( auto walked = 0ul; cursor_va && cursor_va != list_head_va && walked < 64ul; walked++ ) {
+					if ( !memory::is_canonical_kernel_address( cursor_va ) )
+						break;
+
+					auto timer_va = cursor_va - FIELD_OFFSET( KTIMER, TimerListEntry );
+					KTIMER timer_copy{ };
+					if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( timer_va ), sizeof( timer_copy ), &timer_copy, &copied ) )
+						break;
+
+					detections += inspect_timer_candidate( command, modules, timer_va, timer_copy, wait_never, wait_always );
+					cursor_va = reinterpret_cast< unsigned long long >( timer_copy.TimerListEntry.Flink );
+				}
+			}
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_all_prcb_queues(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long wait_never,
+		unsigned long long wait_always ) {
+		auto processor_count = KeQueryActiveProcessorCountEx( ALL_PROCESSOR_GROUPS );
+		if ( !processor_count )
+			processor_count = 1;
+
+		unsigned long detections = 0;
+		for ( auto proc_index = 0ul; proc_index < processor_count; proc_index++ ) {
+			PROCESSOR_NUMBER proc_num{ };
+			if ( NT_SUCCESS( KeGetProcessorNumberFromIndex( proc_index, &proc_num ) ) ) {
+				GROUP_AFFINITY affinity{ };
+				GROUP_AFFINITY previous_affinity{ };
+				affinity.Group = proc_num.Group;
+				affinity.Mask = 1ull << proc_num.Number;
+				KeSetSystemGroupAffinityThread( &affinity, &previous_affinity );
+				detections += scan_current_prcb_queues( command, modules, wait_never, wait_always );
+				KeRevertToUserGroupAffinityThread( &previous_affinity );
+			}
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
@@ -250,7 +374,7 @@ namespace dpc_integrity {
 			memory::copy_kernel_memory( reinterpret_cast< void* >( m_entry.m_pdb.m_ki_wait_always ), sizeof( wait_always ), &wait_always, &copied );
 		}
 
-		unsigned long detections = 0;
+		unsigned long detections = scan_all_prcb_queues( command, modules, wait_never, wait_always );
 		unsigned long scanned_allocations = 0;
 		system_bigpool_information_t* pool_info = nullptr;
 		if ( query_big_pool_for_dpc( &pool_info ) && pool_info ) {

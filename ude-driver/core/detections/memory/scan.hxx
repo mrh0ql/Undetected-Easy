@@ -229,6 +229,32 @@ namespace memory_scan {
 		state.m_physical_ranges = MmGetPhysicalMemoryRanges( );
 		state.m_records = records;
 
+		if ( memory::is_canonical_kernel_address( m_entry.m_pdb.m_mm_pfn_database ) ) {
+			size_t copied = 0;
+			unsigned long long db_base = 0;
+			if ( memory::copy_kernel_memory(
+				reinterpret_cast< void* >( m_entry.m_pdb.m_mm_pfn_database ),
+				sizeof( db_base ),
+				&db_base,
+				&copied ) && memory::is_canonical_kernel_address( db_base ) ) {
+				state.m_pfn_db_base = db_base;
+			}
+		}
+
+		auto cr3_pfn = ( paging::m_directory_table_base & ~0xfffull ) >> page_shift;
+		for ( auto slot = 256ul; slot < 512ul; slot++ ) {
+			pml4e self_entry{ };
+			if ( paging::remap::read_physical(
+				( paging::m_directory_table_base & ~0xfffull ) + slot * sizeof( pml4e ),
+				&self_entry,
+				sizeof( self_entry )
+			) && self_entry.hard.present && self_entry.hard.pfn == cr3_pfn ) {
+				state.m_self_ref_pml4_index = slot;
+				state.m_has_self_ref_pml4 = true;
+				break;
+			}
+		}
+
 		// Memory Integrity classifies kernel mappings. Walking user slots first can
 		// consume the leaf budget before the walker ever reaches the kernel half.
 		for ( auto pml4_index = 256ul; pml4_index < 512 && state.m_leaf_count < m_max_leaf_entries; pml4_index++ ) {
@@ -252,7 +278,7 @@ namespace memory_scan {
 		permissions::flush_executable_region( &state );
 
 		utility::print(
-			"memory integrity: leaf_entries=%lu pfn_records=%lu backing_detections=%lu permission_detections=%lu alias_detections=%lu anonymous_detections=%lu table_detections=%lu pml4_detections=%lu wx_candidates=%lu suppressed=%lu detections=%lu\n",
+			"memory integrity: leaf_entries=%lu pfn_records=%lu backing_detections=%lu permission_detections=%lu alias_detections=%lu anonymous_detections=%lu table_detections=%lu pml4_detections=%lu pfn_db_detections=%lu wx_candidates=%lu suppressed=%lu detections=%lu\n",
 			state.m_leaf_count,
 			state.m_record_count,
 			state.m_backing_detections,
@@ -261,6 +287,7 @@ namespace memory_scan {
 			state.m_anonymous_detections,
 			state.m_table_detections,
 			state.m_pml4_detections,
+			state.m_pfn_db_detections,
 			state.m_wx_candidates,
 			state.m_wx_suppressed,
 			command->m_total_detection_count
@@ -268,7 +295,7 @@ namespace memory_scan {
 
 		command->m_sections_scanned = state.m_leaf_count;
 		command->m_signature_candidates = state.m_record_count;
-		command->m_signature_detections = state.m_backing_detections + state.m_permission_detections + state.m_alias_detections + state.m_anonymous_detections + state.m_table_detections + state.m_pml4_detections;
+		command->m_signature_detections = state.m_backing_detections + state.m_permission_detections + state.m_alias_detections + state.m_anonymous_detections + state.m_table_detections + state.m_pml4_detections + state.m_pfn_db_detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 

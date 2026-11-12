@@ -165,6 +165,35 @@ namespace pdb {
                 }
             }
 
+            CComPtr<IDiaEnumSymbols> pEnumNested;
+            if ( SUCCEEDED( pUDT->findChildren( SymTagData, nullptr, nsNone, &pEnumNested ) ) && pEnumNested ) {
+                CComPtr<IDiaSymbol> pField;
+                ULONG nested_celt = 0;
+                while ( SUCCEEDED( pEnumNested->Next( 1, &pField, &nested_celt ) ) && nested_celt == 1 ) {
+                    BSTR field_name = nullptr;
+                    bool is_anonymous = true;
+                    if ( SUCCEEDED( pField->get_name( &field_name ) ) && field_name ) {
+                        if ( field_name[ 0 ] != L'\0' && wcsncmp( field_name, L"<unnamed", 8 ) != 0 && wcsncmp( field_name, L"__unnamed", 9 ) != 0 )
+                            is_anonymous = false;
+                        SysFreeString( field_name );
+                    }
+
+                    if ( is_anonymous ) {
+                        LONG field_off = 0;
+                        pField->get_offset( &field_off );
+                        CComPtr<IDiaSymbol> pFieldType;
+                        if ( SUCCEEDED( pField->get_type( &pFieldType ) ) && pFieldType ) {
+                            DWORD sym_tag = 0;
+                            if ( SUCCEEDED( pFieldType->get_symTag( &sym_tag ) ) && sym_tag == SymTagUDT ) {
+                                auto result = find_member_in_udt( pFieldType, member_name, base_offset + field_off );
+                                if ( result ) return result;
+                            }
+                        }
+                    }
+                    pField.Release( );
+                }
+            }
+
             CComPtr<IDiaEnumSymbols> pEnumBases;
             if ( FAILED( pUDT->findChildren( SymTagBaseClass, nullptr, nsNone, &pEnumBases ) ) || !pEnumBases )
                 return 0;
@@ -421,14 +450,20 @@ namespace pdb {
             }
 
             auto headers_size = is_x86 ? p_opt32->SizeOfHeaders : p_opt64->SizeOfHeaders;
-            std::memcpy( image_buffer.get( ), buffer.data( ), headers_size );
+            if ( headers_size <= buffer.size( ) && headers_size <= image_size )
+                std::memcpy( image_buffer.get( ), buffer.data( ), headers_size );
 
             auto p_section = IMAGE_FIRST_SECTION( p_nt );
             for ( UINT i = 0; i < p_nt->FileHeader.NumberOfSections; ++i, ++p_section ) {
-                if ( p_section->SizeOfRawData ) {
+                if ( p_section->SizeOfRawData &&
+                    p_section->VirtualAddress < image_size &&
+                    static_cast< size_t >( p_section->PointerToRawData ) < buffer.size( ) ) {
+                    auto max_dst = static_cast< size_t >( image_size - p_section->VirtualAddress );
+                    auto max_src = buffer.size( ) - static_cast< size_t >( p_section->PointerToRawData );
+                    auto copy_len = ( std::min )( static_cast< size_t >( p_section->SizeOfRawData ), ( std::min )( max_dst, max_src ) );
                     std::memcpy( image_buffer.get( ) + p_section->VirtualAddress,
                         buffer.data( ) + p_section->PointerToRawData,
-                        p_section->SizeOfRawData );
+                        copy_len );
                 }
             }
 

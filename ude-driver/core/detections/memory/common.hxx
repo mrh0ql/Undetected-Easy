@@ -49,6 +49,10 @@ namespace memory_scan {
 		unsigned long long m_executable_region_end;
 		unsigned long m_executable_region_pages;
 		bool m_executable_region_has_executable;
+		unsigned long long m_pfn_db_base;
+		unsigned long m_self_ref_pml4_index;
+		bool m_has_self_ref_pml4;
+		unsigned long m_pfn_db_detections;
 	};
 
 	unsigned long long canonicalize_va( unsigned long long address ) {
