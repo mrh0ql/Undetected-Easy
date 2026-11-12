@@ -442,12 +442,134 @@ namespace object_integrity {
 		return 1;
 	}
 
+	unsigned long scan_object_type_initializers(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long* types_scanned ) {
+		if ( types_scanned )
+			*types_scanned = 0;
+
+		auto table_va = m_entry.m_pdb.m_ob_type_index_table;
+		auto type_info_off = m_entry.m_offsets.m_object_type_type_info;
+		auto dump_proc_off = m_entry.m_offsets.m_object_type_init_dump_proc;
+		auto name_off = m_entry.m_offsets.m_object_type_name;
+
+		if ( !command || !modules || !table_va || !memory::is_canonical_kernel_address( table_va ) ||
+			!type_info_off || type_info_off > 0x200 || !dump_proc_off || dump_proc_off > 0x200 )
+			return 0;
+
+		unsigned long long type_ptrs[ 66 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( table_va ), sizeof( type_ptrs ), type_ptrs, &copied ) )
+			return 0;
+
+		constexpr const char* proc_names[ 8 ] = {
+			"DumpProcedure",
+			"OpenProcedure",
+			"CloseProcedure",
+			"DeleteProcedure",
+			"ParseProcedure",
+			"SecurityProcedure",
+			"QueryNameProcedure",
+			"OkayToCloseProcedure"
+		};
+
+		unsigned long detections = 0;
+		for ( auto idx = 2ul; idx < 66ul; idx++ ) {
+			auto obj_type_va = type_ptrs[ idx ];
+			if ( !obj_type_va || !memory::is_canonical_kernel_address( obj_type_va ) )
+				continue;
+
+			unsigned long long procs[ 8 ]{ };
+			auto procs_va = obj_type_va + type_info_off + dump_proc_off;
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( procs_va ), sizeof( procs ), procs, &copied ) )
+				continue;
+
+			if ( types_scanned )
+				( *types_scanned )++;
+
+			char type_name[ 48 ] = "ObjectType";
+			if ( name_off && name_off < 0x100 ) {
+				UNICODE_STRING u_name{ };
+				if ( memory::copy_kernel_memory( reinterpret_cast< void* >( obj_type_va + name_off ), sizeof( u_name ), &u_name, &copied ) &&
+					device_surface::unicode_name_sane( u_name ) ) {
+					wchar_t wide_buf[ 48 ]{ };
+					auto bytes = u_name.Length < ( sizeof( wide_buf ) - sizeof( wchar_t ) )
+						? u_name.Length
+						: ( sizeof( wide_buf ) - sizeof( wchar_t ) );
+					if ( memory::copy_kernel_memory( u_name.Buffer, bytes, wide_buf, &copied ) ) {
+						UNICODE_STRING safe_u{ static_cast< USHORT >( bytes ), sizeof( wide_buf ), wide_buf };
+						device_surface::unicode_to_ascii( safe_u, type_name, sizeof( type_name ) );
+					}
+				}
+			}
+
+			for ( auto p = 0ul; p < 8ul; p++ ) {
+				auto routine = procs[ p ];
+				if ( !routine )
+					continue;
+
+				device_surface::target_info_t info{ };
+				if ( memory::is_canonical_kernel_address( routine ) )
+					device_surface::query_target_info( modules, routine, &info );
+
+				bool inline_hooked = false;
+				unsigned long long hook_dst = 0;
+				unsigned char prologue[ 16 ]{ };
+				if ( info.m_module && memory::copy_kernel_memory( reinterpret_cast< void* >( routine ), sizeof( prologue ), prologue, &copied ) ) {
+					signatures::relative_branch_signature_t rel_sig{ };
+					if ( ( prologue[ 0 ] == 0xE9 || prologue[ 0 ] == 0xEB ) &&
+						signatures::match_relative_branch_signature( prologue, sizeof( prologue ), 0, routine, &rel_sig ) &&
+						detections::is_suspicious_external_target( modules, info.m_module, rel_sig.m_target ) ) {
+						inline_hooked = true;
+						hook_dst = rel_sig.m_target;
+					}
+					else if ( prologue[ 0 ] == 0x48 && prologue[ 1 ] == 0xB8 && prologue[ 10 ] == 0xFF && prologue[ 11 ] == 0xE0 ) {
+						memcpy( &hook_dst, prologue + 2, sizeof( hook_dst ) );
+						if ( detections::is_suspicious_external_target( modules, info.m_module, hook_dst ) )
+							inline_hooked = true;
+					}
+				}
+
+				if ( info.m_owner && info.m_executable && !info.m_bad_backing && !inline_hooked )
+					continue;
+
+				char target[ ioctl::m_detection_target_size ]{ };
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA( target, sizeof( target ), "ObType!%s.%s", type_name, proc_names[ p ] );
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"type_idx=%lu proc=%s target=0x%llx owner=%s hooked=%u hook_dst=0x%llx",
+					idx,
+					proc_names[ p ],
+					routine,
+					info.m_owner ? info.m_owner : "unknown",
+					inline_hooked ? 1ul : 0ul,
+					hook_dst
+				);
+				report::add_memory_detection(
+					command,
+					target,
+					report::m_object_type_hook_violation,
+					detail,
+					procs_va + p * sizeof( unsigned long long ),
+					sizeof( routine )
+				);
+				detections++;
+			}
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
 
 		unsigned long named_sections = 0;
 		unsigned long symbolic_links = 0;
+		unsigned long ob_types = 0;
 		PDRIVER_OBJECT scanned_drivers[ 512 ]{ };
 		unsigned long scanned_driver_count = 0;
 
@@ -459,17 +581,19 @@ namespace object_integrity {
 		);
 		detections += scan_physical_memory_section( command );
 		detections += scan_kuser_shared_data( command );
+		detections += scan_object_type_initializers( command, modules, &ob_types );
 
 		command->m_modules_scanned = modules->m_count;
-		command->m_sections_scanned = named_sections + symbolic_links + 2;
-		command->m_signature_candidates = named_sections + symbolic_links + 2;
+		command->m_sections_scanned = named_sections + symbolic_links + ob_types + 2;
+		command->m_signature_candidates = named_sections + symbolic_links + ( ob_types * 8 ) + 2;
 		command->m_signature_detections = detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 		utility::print(
-			"object integrity: named sections=%lu links=%lu detections=%lu\n",
+			"object integrity: named sections=%lu links=%lu ob_types=%lu detections=%lu\n",
 			named_sections,
 			symbolic_links,
+			ob_types,
 			command->m_total_detection_count
 		);
 		return true;

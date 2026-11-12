@@ -489,7 +489,9 @@ namespace callback {
 		const system_modules_t* modules,
 		const char* table_name,
 		unsigned long slot_index,
-		unsigned long long routine ) {
+		unsigned long long routine,
+		const char* violation_override = nullptr ) {
+		const auto violation_type = violation_override ? violation_override : report::m_kernel_callback_target_violation;
 		if ( !command || !modules || !routine )
 			return 0;
 
@@ -498,7 +500,7 @@ namespace callback {
 			char detail[ ioctl::m_detection_text_size ]{ };
 			RtlStringCbPrintfA( target, sizeof( target ), "callback!%s[%lu]", table_name ? table_name : "notify", slot_index );
 			RtlStringCbPrintfA( detail, sizeof( detail ), "table=%s slot=%lu target=0x%llx reason=non_canonical_target", table_name ? table_name : "notify", slot_index, routine );
-			report::add_memory_detection( command, target, report::m_kernel_callback_target_violation, detail, routine, sizeof( void* ) );
+			report::add_memory_detection( command, target, violation_type, detail, routine, sizeof( void* ) );
 			return 1;
 		}
 
@@ -554,7 +556,7 @@ namespace callback {
 		report::add_memory_detection(
 			command,
 			target,
-			report::m_kernel_callback_target_violation,
+			violation_type,
 			detail,
 			routine,
 			sizeof( void* )
@@ -706,6 +708,120 @@ namespace callback {
 		return detections;
 	}
 
+	struct knmi_handler_callback_t {
+		knmi_handler_callback_t* m_next;
+		void* m_callback;
+		void* m_context;
+		void* m_handle;
+	};
+
+	inline unsigned long scan_nmi_callbacks( ioctl::command_t* command, const system_modules_t* modules ) {
+		auto head_va = m_entry.m_pdb.m_ki_nmi_callback_list_head;
+		if ( !command || !modules || !head_va || !memory::is_canonical_kernel_address( head_va ) )
+			return 0;
+
+		knmi_handler_callback_t* current = nullptr;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( head_va ), sizeof( current ), &current, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto walked = 0ul; current && walked < 64ul; walked++ ) {
+			auto current_va = reinterpret_cast< unsigned long long >( current );
+			if ( !memory::is_canonical_kernel_address( current_va ) )
+				break;
+
+			knmi_handler_callback_t node{ };
+			if ( !memory::copy_kernel_memory( current, sizeof( node ), &node, &copied ) )
+				break;
+
+			if ( node.m_callback ) {
+				detections += validate_callback_target(
+					command,
+					modules,
+					"KiNmiCallbackList",
+					walked,
+					reinterpret_cast< unsigned long long >( node.m_callback ),
+					report::m_nmi_callback_violation
+				);
+			}
+
+			current = node.m_next;
+		}
+
+		return detections;
+	}
+
+	inline unsigned long scan_bugcheck_callbacks( ioctl::command_t* command, const system_modules_t* modules ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		size_t copied = 0;
+
+		auto bc_head_va = m_entry.m_pdb.m_ke_bugcheck_callback_list_head;
+		if ( bc_head_va && memory::is_canonical_kernel_address( bc_head_va ) ) {
+			auto head = reinterpret_cast< LIST_ENTRY* >( bc_head_va );
+			LIST_ENTRY head_copy{ };
+			if ( memory::copy_kernel_memory( head, sizeof( head_copy ), &head_copy, &copied ) ) {
+				auto current = head_copy.Flink;
+				for ( auto walked = 0ul; current && current != head && walked < 256ul; walked++ ) {
+					if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( current ) ) )
+						break;
+
+					KBUGCHECK_CALLBACK_RECORD record{ };
+					if ( !memory::copy_kernel_memory( current, sizeof( record ), &record, &copied ) )
+						break;
+
+					if ( record.State == BufferInserted && record.CallbackRoutine ) {
+						detections += validate_callback_target(
+							command,
+							modules,
+							"KeBugCheckCallbackList",
+							walked,
+							reinterpret_cast< unsigned long long >( record.CallbackRoutine ),
+							report::m_bugcheck_callback_violation
+						);
+					}
+
+					current = record.Entry.Flink;
+				}
+			}
+		}
+
+		auto bcr_head_va = m_entry.m_pdb.m_ke_bugcheck_reason_callback_list_head;
+		if ( bcr_head_va && memory::is_canonical_kernel_address( bcr_head_va ) ) {
+			auto head = reinterpret_cast< LIST_ENTRY* >( bcr_head_va );
+			LIST_ENTRY head_copy{ };
+			if ( memory::copy_kernel_memory( head, sizeof( head_copy ), &head_copy, &copied ) ) {
+				auto current = head_copy.Flink;
+				for ( auto walked = 0ul; current && current != head && walked < 256ul; walked++ ) {
+					if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( current ) ) )
+						break;
+
+					KBUGCHECK_REASON_CALLBACK_RECORD record{ };
+					if ( !memory::copy_kernel_memory( current, sizeof( record ), &record, &copied ) )
+						break;
+
+					if ( record.State == BufferInserted && record.CallbackRoutine ) {
+						detections += validate_callback_target(
+							command,
+							modules,
+							"KeBugCheckReasonCallbackList",
+							walked,
+							reinterpret_cast< unsigned long long >( record.CallbackRoutine ),
+							report::m_bugcheck_callback_violation
+						);
+					}
+
+					current = record.Entry.Flink;
+				}
+			}
+		}
+
+		return detections;
+	}
+
 	inline unsigned long scan_kernel_callbacks( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return 0;
@@ -715,6 +831,8 @@ namespace callback {
 		detections += scan_notify_array( command, modules, m_entry.m_pdb.m_psp_create_thread_notify_routine, "PspCreateThreadNotifyRoutine" );
 		detections += scan_notify_array( command, modules, m_entry.m_pdb.m_psp_load_image_notify_routine, "PspLoadImageNotifyRoutine" );
 		detections += scan_cm_callbacks( command, modules );
+		detections += scan_nmi_callbacks( command, modules );
+		detections += scan_bugcheck_callbacks( command, modules );
 		if ( PsProcessType && *PsProcessType )
 			detections += scan_ob_type_callbacks( command, modules, *PsProcessType, "ObProcessCallbacks" );
 		if ( PsThreadType && *PsThreadType )

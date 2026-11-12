@@ -236,10 +236,131 @@ namespace cpu_integrity {
 		}
 	}
 
-	unsigned long scan_hypervisor_timing( ioctl::command_t* command, unsigned long proc_index ) {
+	unsigned long scan_tss_ist_stacks( ioctl::command_t* command, unsigned long proc_index ) {
+		const auto tss_va = __readgsqword( 0x08 );
+		if ( !command || !tss_va || !memory::is_canonical_kernel_address( tss_va ) )
+			return 0;
+
+		unsigned char tss_bytes[ 0x68 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( tss_va ), sizeof( tss_bytes ), tss_bytes, &copied ) )
+			return 0;
+
+		struct stack_slot_t {
+			const char* m_label;
+			unsigned long long m_sp;
+			bool m_required;
+		};
+
+		unsigned long long rsp0 = 0;
+		memcpy( &rsp0, tss_bytes + 0x04, sizeof( rsp0 ) );
+
+		stack_slot_t slots[ 8 ]{ };
+		slots[ 0 ] = { "Rsp0", rsp0, true };
+
+		static constexpr const char* ist_names[ 7 ] = {
+			"Ist1", "Ist2", "Ist3", "Ist4", "Ist5", "Ist6", "Ist7"
+		};
+		for ( auto i = 0u; i < 7u; i++ ) {
+			unsigned long long ist_val = 0;
+			memcpy( &ist_val, tss_bytes + 0x24 + i * sizeof( unsigned long long ), sizeof( ist_val ) );
+			slots[ i + 1 ] = { ist_names[ i ], ist_val, false };
+		}
+
+		unsigned long detections = 0;
+		for ( auto idx = 0u; idx < ARRAYSIZE( slots ); idx++ ) {
+			const auto sp = slots[ idx ].m_sp;
+			if ( !sp ) {
+				if ( !slots[ idx ].m_required )
+					continue;
+			}
+
+			const char* bad_reason = nullptr;
+			if ( !sp || !memory::is_canonical_kernel_address( sp ) || ( sp & 0x7ull ) != 0 ) {
+				bad_reason = "non_canonical_or_unaligned_sp";
+			}
+			else {
+				const auto probe_va = ( ( sp & 0xFFFull ) == 0 ) ? ( sp - 16ull ) : sp;
+				if ( !MmIsAddressValid( reinterpret_cast< void* >( probe_va ) ) ) {
+					bad_reason = "stack_top_not_resident";
+				}
+				else {
+					paging::pt_entries_t entries{ };
+					if ( paging::hyperspace_entries( entries, probe_va ) && entries.m_pml4e.hard.present && entries.m_pdpte.hard.present ) {
+						bool user_accessible = entries.m_pml4e.hard.user_supervisor && entries.m_pdpte.hard.user_supervisor;
+						bool executable = !entries.m_pml4e.hard.no_execute && !entries.m_pdpte.hard.no_execute;
+
+						if ( !entries.m_pdpte.hard.page_size ) {
+							user_accessible = user_accessible && entries.m_pde.hard.present && entries.m_pde.hard.user_supervisor;
+							executable = executable && entries.m_pde.hard.present && !entries.m_pde.hard.no_execute;
+							if ( !entries.m_pde.hard.page_size ) {
+								user_accessible = user_accessible && entries.m_pte.hard.present && entries.m_pte.hard.user_supervisor;
+								executable = executable && entries.m_pte.hard.present && !entries.m_pte.hard.no_execute;
+							}
+						}
+
+						if ( user_accessible )
+							bad_reason = "user_accessible_tss_stack";
+						else if ( executable )
+							bad_reason = "executable_tss_stack";
+					}
+				}
+			}
+
+			if ( !bad_reason )
+				continue;
+
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "cpu!ktss64_%s", slots[ idx ].m_label );
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"cpu=%lu tss=0x%llx slot=%s sp=0x%llx reason=%s",
+				proc_index,
+				tss_va,
+				slots[ idx ].m_label,
+				sp,
+				bad_reason
+			);
+			report::add_memory_detection(
+				command,
+				target,
+				report::m_tss_ist_stack_violation,
+				detail,
+				sp ? sp : tss_va,
+				sizeof( unsigned long long )
+			);
+			detections++;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan_hypervisor_timing( ioctl::command_t* command, const system_modules_t* modules, unsigned long proc_index ) {
 		int leaf1[ 4 ]{ };
 		__cpuid( leaf1, 1 );
 		const bool hypervisor_bit = ( leaf1[ 2 ] & ( 1 << 31 ) ) != 0;
+
+		int hv_leaf0[ 4 ]{ };
+		__cpuid( hv_leaf0, 0x40000000 );
+		const auto hv_max_leaf = static_cast< unsigned int >( hv_leaf0[ 0 ] );
+		const bool hv_leaf_leaked = !hypervisor_bit && hv_max_leaf >= 0x40000001u && hv_max_leaf <= 0x4000FFFFu;
+
+		bool has_type2_host_driver = false;
+		if ( modules ) {
+			has_type2_host_driver =
+				module::disk::find_module_by_file_name( modules, "vmx86.sys" ) != nullptr ||
+				module::disk::find_module_by_file_name( modules, "VBoxDrv.sys" ) != nullptr ||
+				module::disk::find_module_by_file_name( modules, "VBoxSup.sys" ) != nullptr ||
+				module::disk::find_module_by_file_name( modules, "gvmm.sys" ) != nullptr ||
+				module::disk::find_module_by_file_name( modules, "hvax64.sys" ) != nullptr;
+		}
+
+		const auto cr4 = __readcr4( );
+		const auto efer = __readmsr( 0xC0000080ul );
+		const bool unshadowed_vmxe_or_svme = !hypervisor_bit && !has_type2_host_driver &&
+			( ( cr4 & ( 1ull << 13 ) ) != 0 || ( efer & ( 1ull << 12 ) ) != 0 );
 
 		int leaf6[ 4 ]{ };
 		__cpuid( leaf6, 6 );
@@ -250,14 +371,35 @@ namespace cpu_integrity {
 
 		unsigned int aux = 0;
 		unsigned long long min_cpuid_cycles = ~0ull;
+		unsigned long long min_alu_cycles = ~0ull;
+		unsigned long long min_combined_cycles = ~0ull;
+		unsigned long long alu_acc = 0x9E3779B97F4A7C15ull ^ proc_index;
 		bool tsc_rewound = false;
+
+		for ( auto sample = 0ul; sample < 32ul; sample++ ) {
+			auto v = alu_acc ^ sample;
+			const auto a0 = __rdtscp( &aux );
+			for ( auto step = 0u; step < 64u; step++ )
+				v = ( v * 0x5851F42D4C957F2Dull ) ^ ( v >> 17 );
+			const auto a1 = __rdtscp( &aux );
+			alu_acc ^= v;
+
+			if ( a1 <= a0 || ( a1 - a0 ) > ( 1ull << 40 ) ) {
+				tsc_rewound = true;
+				break;
+			}
+
+			const auto alu_delta = a1 - a0;
+			if ( alu_delta < min_alu_cycles )
+				min_alu_cycles = alu_delta;
+		}
 
 		unsigned long long aperf_start = 0;
 		unsigned long long aperf_end = 0;
 		const bool aperf_ok_start = has_aperf && safe_read_aperf( &aperf_start );
 		const auto total_tsc_start = __rdtscp( &aux );
 
-		for ( auto sample = 0ul; sample < 32ul; sample++ ) {
+		for ( auto sample = 0ul; sample < 32ul && !tsc_rewound; sample++ ) {
 			int dummy[ 4 ]{ };
 			const auto t0 = __rdtscp( &aux );
 			__cpuid( dummy, 1 );
@@ -271,6 +413,23 @@ namespace cpu_integrity {
 			const auto delta = t1 - t0;
 			if ( delta < min_cpuid_cycles )
 				min_cpuid_cycles = delta;
+
+			auto v = alu_acc ^ static_cast< unsigned long long >( dummy[ 0 ] );
+			const auto c0 = __rdtscp( &aux );
+			__cpuid( dummy, 1 );
+			for ( auto step = 0u; step < 64u; step++ )
+				v = ( v * 0x5851F42D4C957F2Dull ) ^ ( v >> 17 );
+			const auto c1 = __rdtscp( &aux );
+			alu_acc ^= v;
+
+			if ( c1 <= c0 || ( c1 - c0 ) > ( 1ull << 40 ) ) {
+				tsc_rewound = true;
+				break;
+			}
+
+			const auto combined_delta = c1 - c0;
+			if ( combined_delta < min_combined_cycles )
+				min_combined_cycles = combined_delta;
 		}
 
 		const auto total_tsc_end = __rdtscp( &aux );
@@ -278,25 +437,36 @@ namespace cpu_integrity {
 
 		KeLowerIrql( old_irql );
 
+		volatile unsigned long long prevent_dce = alu_acc;
+		UNREFERENCED_PARAMETER( prevent_dce );
+
 		const auto total_tsc_delta = total_tsc_end > total_tsc_start ? ( total_tsc_end - total_tsc_start ) : 0ull;
 		const auto total_aperf_delta = ( aperf_ok_end && aperf_end >= aperf_start ) ? ( aperf_end - aperf_start ) : 0ull;
 		const bool aperf_skew = aperf_ok_end && total_tsc_delta > 0 && total_aperf_delta > total_tsc_delta * 16ull;
 		const bool hidden_vmexit_latency = !hypervisor_bit && min_cpuid_cycles > 1600ull && min_cpuid_cycles != ~0ull;
+		const bool tsc_offset_oversubtracted =
+			min_alu_cycles != ~0ull &&
+			min_combined_cycles != ~0ull &&
+			( min_combined_cycles * 2ull ) < min_alu_cycles;
 
-		if ( !tsc_rewound && !aperf_skew && !hidden_vmexit_latency )
+		if ( !tsc_rewound && !aperf_skew && !hidden_vmexit_latency &&
+			!tsc_offset_oversubtracted && !hv_leaf_leaked && !unshadowed_vmxe_or_svme )
 			return 0;
 
 		char detail[ ioctl::m_detection_text_size ]{ };
 		RtlStringCbPrintfA(
 			detail,
 			sizeof( detail ),
-			"cpu=%lu hv_bit=%u min_cpuid_tsc=%llu total_tsc=%llu aperf=%llu rewound=%u",
+			"cpu=%lu hv_bit=%u cpuid=%llu alu=%llu comb=%llu aperf=%llu leaf=0x%x vmxe_svme=%u rewound=%u",
 			proc_index,
 			hypervisor_bit ? 1ul : 0ul,
 			min_cpuid_cycles == ~0ull ? 0ull : min_cpuid_cycles,
-			total_tsc_delta,
+			min_alu_cycles == ~0ull ? 0ull : min_alu_cycles,
+			min_combined_cycles == ~0ull ? 0ull : min_combined_cycles,
 			total_aperf_delta,
-			tsc_rewound ? 1ul : 0ul
+			hv_max_leaf,
+			unshadowed_vmxe_or_svme ? 1ul : 0ul,
+			( tsc_rewound || tsc_offset_oversubtracted ) ? 1ul : 0ul
 		);
 		report::add_memory_detection(
 			command,
@@ -337,7 +507,8 @@ namespace cpu_integrity {
 				detections += scan_msrs( command, modules );
 				detections += scan_control_registers( command, proc_index );
 				detections += scan_debug_registers( command, proc_index );
-				detections += scan_hypervisor_timing( command, proc_index );
+				detections += scan_tss_ist_stacks( command, proc_index );
+				detections += scan_hypervisor_timing( command, modules, proc_index );
 
 				KeRevertToUserGroupAffinityThread( &previous_affinity );
 			}
@@ -349,7 +520,8 @@ namespace cpu_integrity {
 				detections += scan_msrs( command, modules );
 				detections += scan_control_registers( command, 0 );
 				detections += scan_debug_registers( command, 0 );
-				detections += scan_hypervisor_timing( command, 0 );
+				detections += scan_tss_ist_stacks( command, 0 );
+				detections += scan_hypervisor_timing( command, modules, 0 );
 			}
 		}
 

@@ -384,24 +384,230 @@ namespace service_integrity::ssdt {
 		return detections;
 	}
 
+	bool is_win32k_family_module( const char* owner_name ) {
+		if ( !owner_name )
+			return false;
+
+		return ascii_equal_insensitive( owner_name, "win32k.sys" ) ||
+			ascii_equal_insensitive( owner_name, "win32kfull.sys" ) ||
+			ascii_equal_insensitive( owner_name, "win32kbase.sys" );
+	}
+
+	unsigned long scan_win32k_shadow_descriptor(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long shadow_array_va,
+		unsigned long long ntos_ssdt_va ) {
+		if ( !command || !modules || !shadow_array_va || !memory::is_canonical_kernel_address( shadow_array_va ) )
+			return 0;
+
+		kservice_table_descriptor_t shadow[ 2 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( shadow_array_va ), sizeof( shadow ), shadow, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		if ( ntos_ssdt_va && memory::is_canonical_kernel_address( ntos_ssdt_va ) ) {
+			kservice_table_descriptor_t primary{ };
+			if ( memory::copy_kernel_memory( reinterpret_cast< void* >( ntos_ssdt_va ), sizeof( primary ), &primary, &copied ) ) {
+				if ( primary.m_service_table_base != shadow[ 0 ].m_service_table_base ||
+					primary.m_number_of_services != shadow[ 0 ].m_number_of_services ) {
+					char detail[ ioctl::m_detection_text_size ]{ };
+					RtlStringCbPrintfA(
+						detail,
+						sizeof( detail ),
+						"ssdt_base=0x%llx shadow_base=0x%llx reason=ssdt_shadow_desync",
+						reinterpret_cast< unsigned long long >( primary.m_service_table_base ),
+						reinterpret_cast< unsigned long long >( shadow[ 0 ].m_service_table_base )
+					);
+					report::add_memory_detection(
+						command,
+						"KeServiceDescriptorTableShadow[0]",
+						report::m_ssdt_target_violation,
+						detail,
+						shadow_array_va,
+						sizeof( shadow[ 0 ] )
+					);
+					detections++;
+				}
+			}
+		}
+
+		auto w32_base = reinterpret_cast< unsigned long long >( shadow[ 1 ].m_service_table_base );
+		auto w32_count = static_cast< unsigned long >( shadow[ 1 ].m_number_of_services );
+		if ( !w32_base || !memory::is_canonical_kernel_address( w32_base ) || w32_count < 64 || w32_count > 2048 )
+			return detections;
+
+		auto offsets = memory::allocate_pool< long* >( w32_count * sizeof( long ), 1 );
+		if ( !offsets )
+			return detections;
+
+		memset( offsets, 0, w32_count * sizeof( long ) );
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( w32_base ), w32_count * sizeof( long ), offsets, &copied ) ) {
+			memory::free_pool( offsets );
+			return detections;
+		}
+
+		for ( auto index = 0ul; index < w32_count; index++ ) {
+			auto delta = static_cast< long long >( offsets[ index ] ) >> 4;
+			auto routine = static_cast< unsigned long long >( static_cast< long long >( w32_base ) + delta );
+			if ( !memory::is_canonical_kernel_address( routine ) )
+				continue;
+
+			command->m_signature_candidates++;
+			target_info_t info{ };
+			query_target_info( modules, routine, &info );
+
+			bool inline_hooked = false;
+			unsigned long long hook_target = 0;
+			unsigned char prologue[ 16 ]{ };
+			if ( info.m_module && memory::copy_kernel_memory( reinterpret_cast< void* >( routine ), sizeof( prologue ), prologue, &copied ) ) {
+				signatures::relative_branch_signature_t rel_sig{ };
+				if ( ( prologue[ 0 ] == 0xE9 || prologue[ 0 ] == 0xEB ) &&
+					signatures::match_relative_branch_signature( prologue, sizeof( prologue ), 0, routine, &rel_sig ) ) {
+					auto dst_owner = memory::lookup_address_owner( modules, rel_sig.m_target );
+					if ( !is_win32k_family_module( dst_owner ) && !ascii_equal_insensitive( dst_owner, "ntoskrnl.exe" ) ) {
+						inline_hooked = true;
+						hook_target = rel_sig.m_target;
+					}
+				}
+				else if ( prologue[ 0 ] == 0x48 && prologue[ 1 ] == 0xB8 && prologue[ 10 ] == 0xFF && prologue[ 11 ] == 0xE0 ) {
+					memcpy( &hook_target, prologue + 2, sizeof( hook_target ) );
+					auto dst_owner = memory::lookup_address_owner( modules, hook_target );
+					if ( !is_win32k_family_module( dst_owner ) && !ascii_equal_insensitive( dst_owner, "ntoskrnl.exe" ) )
+						inline_hooked = true;
+				}
+			}
+
+			if ( is_win32k_family_module( info.m_owner ) && info.m_executable && !info.m_bad_backing && !inline_hooked )
+				continue;
+
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "W32pServiceTable[%lu]", index );
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"syscall=0x%lx target=0x%llx owner=%s section=%s hooked=%u hook_dst=0x%llx",
+				0x1000ul + index,
+				routine,
+				info.m_owner ? info.m_owner : "unknown",
+				info.m_section[ 0 ] ? info.m_section : "unknown",
+				inline_hooked ? 1ul : 0ul,
+				hook_target
+			);
+			report::add_memory_detection(
+				command,
+				target,
+				report::m_ssdt_target_violation,
+				detail,
+				routine,
+				sizeof( void* )
+			);
+			detections++;
+		}
+
+		memory::free_pool( offsets );
+		return detections;
+	}
+
 	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* nt_module ) {
 		if ( !command || !modules || !nt_module )
 			return 0;
 
-		return scan_descriptor( command, modules, nt_module, m_entry.m_pdb.m_ke_service_descriptor_table, "KeServiceDescriptorTable" );
+		auto detections = scan_descriptor( command, modules, nt_module, m_entry.m_pdb.m_ke_service_descriptor_table, "KeServiceDescriptorTable" );
+		detections += scan_win32k_shadow_descriptor(
+			command,
+			modules,
+			m_entry.m_pdb.m_ke_service_descriptor_table_shadow,
+			m_entry.m_pdb.m_ke_service_descriptor_table
+		);
+		return detections;
 	}
 }
 
 namespace service_integrity::etw {
-	unsigned long scan( ioctl::command_t* command ) {
+	unsigned long scan_wmi_logger_contexts( ioctl::command_t* command, const system_modules_t* modules ) {
+		auto array_ptr_va = m_entry.m_pdb.m_wmip_logger_context;
+		auto clock_offset = m_entry.m_offsets.m_wmi_logger_get_cpu_clock;
+		if ( !command || !modules || !array_ptr_va || !memory::is_canonical_kernel_address( array_ptr_va ) ||
+			!clock_offset || clock_offset > 0x400 )
+			return 0;
+
+		unsigned long long array_va = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( array_ptr_va ), sizeof( array_va ), &array_va, &copied ) ||
+			!array_va || !memory::is_canonical_kernel_address( array_va ) )
+			return 0;
+
+		unsigned long long contexts[ 64 ]{ };
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( array_va ), sizeof( contexts ), contexts, &copied ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto logger_id = 0ul; logger_id < 64ul; logger_id++ ) {
+			auto ctx_va = contexts[ logger_id ];
+			if ( !ctx_va || !memory::is_canonical_kernel_address( ctx_va ) )
+				continue;
+
+			unsigned long long get_cpu_clock = 0;
+			if ( !memory::copy_kernel_memory(
+				reinterpret_cast< void* >( ctx_va + clock_offset ),
+				sizeof( get_cpu_clock ),
+				&get_cpu_clock,
+				&copied ) )
+				continue;
+
+			command->m_signature_candidates++;
+			if ( get_cpu_clock <= 16ull )
+				continue;
+
+			target_info_t info{ };
+			if ( memory::is_canonical_kernel_address( get_cpu_clock ) )
+				query_target_info( modules, get_cpu_clock, &info );
+
+			const bool trusted_clock = info.m_owner && info.m_executable && !info.m_bad_backing &&
+				( ascii_equal_insensitive( info.m_owner, "ntoskrnl.exe" ) ||
+					ascii_equal_insensitive( info.m_owner, "hal.dll" ) );
+			if ( trusted_clock )
+				continue;
+
+			char target[ ioctl::m_detection_target_size ]{ };
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA( target, sizeof( target ), "WmipLoggerContext[%lu]!GetCpuClock", logger_id );
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"logger=%lu ctx=0x%llx get_cpu_clock=0x%llx owner=%s reason=infinityhook_cpu_clock",
+				logger_id,
+				ctx_va,
+				get_cpu_clock,
+				info.m_owner ? info.m_owner : "unknown"
+			);
+			report::add_memory_detection(
+				command,
+				target,
+				report::m_infinity_hook_etw_violation,
+				detail,
+				ctx_va + clock_offset,
+				sizeof( get_cpu_clock )
+			);
+			detections++;
+		}
+
+		return detections;
+	}
+
+	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules ) {
+		unsigned long detections = scan_wmi_logger_contexts( command, modules );
 		auto reg_handle_va = m_entry.m_pdb.m_etw_threat_int_prov_reg_handle;
 		if ( !command || !reg_handle_va || !memory::is_canonical_kernel_address( reg_handle_va ) )
-			return 0;
+			return detections;
 
 		unsigned long long reg_entry = 0;
 		size_t copied = 0;
 		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( reg_handle_va ), sizeof( reg_entry ), &reg_entry, &copied ) )
-			return 0;
+			return detections;
 
 		command->m_signature_candidates++;
 		if ( !reg_entry || !memory::is_canonical_kernel_address( reg_entry ) ) {
@@ -421,7 +627,7 @@ namespace service_integrity::etw {
 				reg_handle_va,
 				sizeof( reg_entry )
 			);
-			return 1;
+			return detections + 1;
 		}
 
 		unsigned long long guid_entry = 0;
@@ -443,10 +649,107 @@ namespace service_integrity::etw {
 				reg_entry + 0x20ull,
 				sizeof( guid_entry )
 			);
-			return 1;
+			return detections + 1;
 		}
 
-		return 0;
+		return detections;
+	}
+}
+
+namespace service_integrity::data_pointers {
+	unsigned long check_nt_data_pointer(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const system_module_t* nt_module,
+		unsigned long long slot_va,
+		const char* symbol_name,
+		bool allow_ci_dll ) {
+		if ( !command || !modules || !nt_module || !slot_va || !memory::is_canonical_kernel_address( slot_va ) )
+			return 0;
+
+		auto nt_start = reinterpret_cast< unsigned long long >( nt_module->m_image_base );
+		auto nt_end = nt_start + nt_module->m_image_size;
+		if ( slot_va < nt_start || slot_va + sizeof( unsigned long long ) > nt_end )
+			return 0;
+
+		if ( module::disk::is_address_in_executable_section( nt_module, slot_va, nullptr, 0 ) )
+			return 0;
+
+		unsigned long long target = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( slot_va ), sizeof( target ), &target, &copied ) || !target )
+			return 0;
+
+		command->m_signature_candidates++;
+		target_info_t info{ };
+		if ( memory::is_canonical_kernel_address( target ) )
+			query_target_info( modules, target, &info );
+
+		bool allowed_owner = info.m_owner &&
+			( ascii_equal_insensitive( info.m_owner, "ntoskrnl.exe" ) ||
+				ascii_equal_insensitive( info.m_owner, "hal.dll" ) ||
+				ascii_equal_insensitive( info.m_owner, "kdcom.dll" ) ||
+				ascii_equal_insensitive( info.m_owner, "kd.dll" ) ||
+				ascii_equal_insensitive( info.m_owner, "kdnet.dll" ) ||
+				( allow_ci_dll && ascii_equal_insensitive( info.m_owner, "CI.dll" ) ) );
+
+		if ( allowed_owner && info.m_executable && !info.m_bad_backing )
+			return 0;
+
+		char target_name[ ioctl::m_detection_target_size ]{ };
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA( target_name, sizeof( target_name ), "ntoskrnl!%s", symbol_name ? symbol_name : "data_ptr" );
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"slot=0x%llx target=0x%llx owner=%s section=%s bad_pfn=%u",
+			slot_va,
+			target,
+			info.m_owner ? info.m_owner : "unknown",
+			info.m_section[ 0 ] ? info.m_section : "unknown",
+			info.m_bad_backing ? 1ul : 0ul
+		);
+		report::add_memory_detection(
+			command,
+			target_name,
+			report::m_kernel_data_pointer_violation,
+			detail,
+			slot_va,
+			sizeof( target )
+		);
+		return 1;
+	}
+
+	unsigned long scan( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* nt_module ) {
+		if ( !command || !modules || !nt_module )
+			return 0;
+
+		unsigned long detections = 0;
+		detections += check_nt_data_pointer(
+			command,
+			modules,
+			nt_module,
+			m_entry.m_pdb.m_kd_enumerate_debugging_devices,
+			"KdEnumerateDebuggingDevices",
+			false
+		);
+		detections += check_nt_data_pointer(
+			command,
+			modules,
+			nt_module,
+			m_entry.m_pdb.m_se_validate_image_header,
+			"SeValidateImageHeader",
+			true
+		);
+		detections += check_nt_data_pointer(
+			command,
+			modules,
+			nt_module,
+			m_entry.m_pdb.m_se_validate_image_data,
+			"SeValidateImageData",
+			true
+		);
+		return detections;
 	}
 }
 
@@ -472,7 +775,8 @@ namespace service_integrity {
 		auto msr_detections = msr::scan( command, modules );
 		auto hal_detections = hal::scan( command, modules );
 		auto ssdt_detections = ssdt::scan( command, modules, nt_module );
-		auto etw_detections = etw::scan( command );
+		auto etw_detections = etw::scan( command, modules );
+		auto data_ptr_detections = data_pointers::scan( command, modules, nt_module );
 		auto callback_detections = callback::scan_kernel_callbacks( command, modules );
 		auto routine_detections = routines::scan_nt_exports(
 			command,
@@ -483,13 +787,14 @@ namespace service_integrity {
 		);
 
 		utility::print(
-			"service integrity: modules=%lu candidates=%lu msr=%lu hal=%lu ssdt=%lu etw=%lu callbacks=%lu routines=%lu detections=%lu\n",
+			"service integrity: modules=%lu candidates=%lu msr=%lu hal=%lu ssdt=%lu etw=%lu data_ptrs=%lu callbacks=%lu routines=%lu detections=%lu\n",
 			modules->m_count,
 			command->m_signature_candidates,
 			msr_detections,
 			hal_detections,
 			ssdt_detections,
 			etw_detections,
+			data_ptr_detections,
 			callback_detections,
 			routine_detections,
 			command->m_total_detection_count
@@ -497,8 +802,8 @@ namespace service_integrity {
 
 		memory::free_pool( disk_image );
 		command->m_modules_scanned = modules->m_count;
-		command->m_sections_scanned = 6;
-		command->m_signature_detections = msr_detections + hal_detections + ssdt_detections + etw_detections + callback_detections + routine_detections;
+		command->m_sections_scanned = 7;
+		command->m_signature_detections = msr_detections + hal_detections + ssdt_detections + etw_detections + data_ptr_detections + callback_detections + routine_detections;
 		command->m_result = true;
 		command->m_error = STATUS_SUCCESS;
 		return true;

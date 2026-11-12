@@ -60,7 +60,7 @@ If a driver patches another module, redirects a function table, changes page per
 <details>
   <summary><b>Execution Integrity</b></summary>
 
-  Execution integrity fires real per-core synthetic NMIs (`HalSendNMI` + `KeRegisterNmiCallback`), inspects hardware `IRETQ` frames and kernel stacks, and audits `ETHREAD` state to verify where kernel code is executing. <br />
+  Execution integrity fires real per-core synthetic NMIs (`HalSendNMI` + `KeRegisterNmiCallback`), inspects hardware `IRETQ` frames and kernel stacks, and audits `ETHREAD` + `PspCidTable` state to verify where kernel code is executing. <br />
 
 # What It Detects
 * Per-core synthetic NMI interrupted `RIP` and stack frames executing from non-backed memory
@@ -69,12 +69,13 @@ If a driver patches another module, redirects a function table, changes page per
 * Return addresses backed by suspicious backing
 * Stack pointers outside kernel stack bounds
 * Suspicious call stack owner chains
-* System thread `_ETHREAD.StartAddress` spoofing or `DebugActive` (`ActiveDR7`) anomalies
+* System thread `_ETHREAD.StartAddress` spoofing, `SystemThread` DKOM flag clearing (`PID == 4` with `PsIsSystemThread == FALSE`), or `DebugActive` (`ActiveDR7`) anomalies
+* Unlinked system threads discovered via `PsLookupThreadByThreadId` (`PspCidTable` sweep) missing from `ZwQuerySystemInformation`
 * Repeated execution from small code caves
 
 # Why It Matters
 This detection is likely to happen when using public driver mappers like **KDMapper, GDrv-loader, e.g..** that allocate in **non-backed memory**. <br />
-Even if a driver hides its threads or avoids `PsCreateSystemThread`, **per-core NMI stack sampling catches code mid-execution** across every logical processor. <br />
+Even if a driver unlinks its thread or clears `_KTHREAD.SystemThread` via DKOM, **per-core NMI stack sampling and `PspCidTable` CID sweeps catch hidden execution** across every logical processor. <br />
 This can also happen because of **messy execution from hook callstacks, `_ETHREAD.StartAddress` DKOM spoofing, and bad thread hiding**. <br />
 
 </details>
@@ -146,61 +147,68 @@ If a process, thread, or address space exists in kernel structures but is hidden
 <details>
   <summary><b>Device & Object Integrity</b></summary>
 
-  Device and object integrity scans named kernel objects, `\Device\PhysicalMemory` security descriptors, `CI.dll` hash caches, device stacks, filter drivers, and dispatch surfaces. <br />
+  Device and object integrity scans named kernel objects, `ObTypeIndexTable` initializers, `\Device\PhysicalMemory` security descriptors, `CI.dll` DSE & hash caches, `FLTMGR.SYS` minifilters, HWID dispatch surfaces, and device stacks. <br />
 
 # What It Detects
 * World-writable named sections
 * Permissive `\Device\PhysicalMemory` DACLs granting user/non-SYSTEM `SECTION_MAP_READ` / `SECTION_MAP_WRITE` access
 * Writable or executable `KUSER_SHARED_DATA` (`0xFFFFF78000000000`) PTE tampering
+* `ObTypeIndexTable` `_OBJECT_TYPE_INITIALIZER` procedure hooks (`Dump`, `Open`, `Close`, `Delete`, `Parse`, `Security`, `QueryName`, `OkayToClose`) and inline detours
 * Public `\GLOBAL??` symbolic links targeting unbacked or anomalous devices
-* Full `AttachedDevice` stack chains, `\Driver\pci` attached DMA/filter devices, `\FileSystem` / `\FileSystem\Filters` stacks, and `ndis.sys!ndisGlobalFilterList` filter handlers
+* Full `AttachedDevice` stack chains, `\Driver\pci` attached DMA/filter devices, `\FileSystem` / `\FileSystem\Filters` stacks, `FLTMGR.SYS!FltGlobals` registered minifilter `PreOperation`/`PostOperation` callbacks, and `ndis.sys!ndisGlobalFilterList` filter handlers
+* HWID spoofer `MajorFunction` redirections, filter stacks, and prologue inline hooks (`E9`/`EB`, `FF 25`, `mov rax; jmp rax`, `push/ret`) across `disk`, `partmgr`, `mountmgr`, `volmgr`, `storahci`, `stornvme`, `nvme`, `EhStorClass`, `iaStorAVC`, `mssmbios`, `acpi`, `nsiproxy`, `Tcpip`, and `NDIS`
 * Devices owned by hidden or unloaded drivers
 * Driver objects that do not match loaded modules
 * Vulnerable drivers matching Microsoft's Vulnerable Driver Blocklist (by filename, attribute, or SHA1 image digest)
+* `CI.dll!g_CiOptions` runtime DSE disabling or injected `TESTSIGNING` bit mismatches against boot `SystemStartOptions`
 * `CI.dll!g_KernelHashBucketList`, `PiDDBCacheTable`, and `MmUnloadedDrivers` history traces, wiped entries, or broken links
 * Broad or memory-control-shaped IOCTL dispatch surfaces
 * Dispatch routines outside the owning module, pointing to unknown memory, backed by suspicious PFNs, or located in writable executable memory
 
 # Why It Matters
-A kernel driver usually **needs some way to communicate** with usermode or intercept I/O stacks. <br />
-Anti-cheats audit **`CI.dll!g_KernelHashBucketList`, `PiDDBCacheTable`, `MmUnloadedDrivers`, `\Device\PhysicalMemory`, PCI/filesystem/NDIS filter chains, and `MajorFunction` tables** to expose vulnerable driver loaders and hidden communication hooks. <br />
+A kernel driver or HWID spoofer usually **needs some way to communicate** with usermode or intercept storage/network/object stacks. <br />
+Anti-cheats audit **`CI.dll!g_CiOptions`, `CI.dll!g_KernelHashBucketList`, `PiDDBCacheTable`, `MmUnloadedDrivers`, `ObTypeIndexTable`, `FLTMGR.SYS` minifilters, and storage/SMBIOS/NIC `MajorFunction` tables** to expose vulnerable driver loaders, HWID spoofers, and hidden communication hooks. <br />
 
 </details>
 
 <details>
   <summary><b>Service Integrity</b></summary>
 
-  Service integrity validates `KeServiceDescriptorTable` (SSDT), kernel notification/object/registry callbacks, `EtwThreatIntProvRegHandle`, and `HalDispatchTable` / `HalPrivateDispatchTable` routines. <br />
+  Service integrity validates `KeServiceDescriptorTable` (SSDT), `KeServiceDescriptorTableShadow` (`W32pServiceTable` Win32k SSDT), `WmipLoggerContext` (InfinityHook), `.data` function pointers, kernel callbacks (`KiNmiCallbackListHead`, `KeBugCheck*`, `Psp*`, `Cm*`, `Ob*`), `EtwThreatIntProvRegHandle`, and `HalDispatchTable` / `HalPrivateDispatchTable` routines. <br />
   
 # What It Detects
-* `KeServiceDescriptorTable` (SSDT) routines pointing outside `ntoskrnl.exe` or patched with prologue inline hooks
+* `KeServiceDescriptorTable` (SSDT) and `KeServiceDescriptorTableShadow` (`W32pServiceTable` Win32k GUI SSDT) routines pointing outside system modules, shadow table desync, or prologue inline hooks
+* InfinityHook-style ETW syscall hooks via `WmipLoggerContext` `_WMI_LOGGER_CONTEXT.GetCpuClock` pointer swaps
+* `ntoskrnl.exe` `.data` function pointer swaps (`KdEnumerateDebuggingDevices`, `SeValidateImageHeader`, `SeValidateImageData`)
+* Registered NMI callbacks (`KiNmiCallbackListHead` anti-NMI blockers) and bugcheck callbacks (`KeBugCheckCallbackListHead` / `KeBugCheckReasonCallbackListHead`) outside signed modules
 * Kernel callbacks (`PspCreateProcessNotifyRoutine`, `PspCreateThreadNotifyRoutine`, `PspLoadImageNotifyRoutine`, `CmCallbackListHead`, and `ObRegisterCallbacks` on `PsProcessType` / `PsThreadType`) targeting unbacked code
 * `EtwThreatIntProvRegHandle` (ETW Threat Intelligence) provider disabling or `_ETW_REG_ENTRY` corruption
 * `HalDispatchTable` and `HalPrivateDispatchTable` function pointers redirected outside system modules
 * Service routine targets outside trusted kernel code or backed by suspicious executable regions
 
 # Why It Matters
-Service-table hooks, rogue kernel callbacks, and ETW-TI blinding are **high-priority EasyAntiCheat and BattlEye detection vectors**. <br />
-Validating SSDT targets, callback arrays, HAL dispatch tables, and ETW-TI provider state exposes redirections even when loaded-module lists appear clean. <br />
+Service-table hooks, Win32k shadow SSDT detours, `.data` pointer swaps, InfinityHook `GetCpuClock` abuse, anti-NMI callback blockers, and ETW-TI blinding are **prime EasyAntiCheat and BattlEye detection vectors**. <br />
+Validating both SSDTs, `.data` pointers, NMI/bugcheck/notify callback lists, HAL dispatch tables, and ETW-TI/WMI logger state exposes redirections even when `.text` sections appear untouched. <br />
 
 </details>
 
 <details>
   <summary><b>CPU Integrity</b></summary>
 
-  CPU integrity checks processor-level control registers, hardware debug registers, hypervisor VM-exit timing, privileged MSR/IDT targets, and PatchGuard state across all logical cores. <br />
+  CPU integrity checks processor-level control registers, hardware `KTSS64` interrupt stacks, hardware debug registers, hypervisor VM-exit timing & architectural leaks, privileged MSR/IDT targets, and PatchGuard state across all logical cores. <br />
 
 # What It Detects
 * Per-processor IDT handlers outside trusted code across all logical cores
+* Per-processor `KTSS64` `Rsp0` and `Ist[1..7]` stack pointers that are non-canonical, unaligned, non-resident, user-accessible, or executable
 * Processor MSR targets (`IA32_LSTAR`, `IA32_CSTAR`, `IA32_SYSENTER_EIP`) outside trusted code
 * Disabled processor security bits (`CR0.WP`, `CR4.SMEP`, or `IA32_EFER.NXE`) on any logical core
 * Active kernel hardware debug breakpoints (`DR0`–`DR3` and `DR7`) when no kernel debugger is attached
-* Stealth hypervisor VM-exit latency inflation (`RDTSCP -> CPUID -> RDTSCP`) and `IA32_APERF` / TSC offsetting skew
+* Stealth hypervisor VM-exit latency inflation (`RDTSCP -> CPUID -> RDTSCP`), ALU-vs-`CPUID` `TSC_OFFSET` over-subtraction, `IA32_APERF` skew, leaked `CPUID(0x40000000)` leaves, and unshadowed `CR4.VMXE` / `IA32_EFER.SVME` bits
 * PatchGuard and kernel debugger state tampering (`KdDebuggerNotPresent`, `KdPitchDebugger`, `SharedUserData->KdDebuggerEnabled`, `KeBugCheckEx` hooks, and `KiWaitNever` / `KiWaitAlways` timer keys)
 
 # Why It Matters
-Advanced projects **avoid normal software hooks and instead use stealth hypervisors (EPT/NPT), hardware debug registers, or disabled SMEP/WP bits**. <br />
-Anti-cheats run per-core hardware register audits and `CPUID` / `IA32_APERF` timing checks at `HIGH_LEVEL` to detect hypervisor interception and CPU security tampering. <br />
+Advanced projects **avoid normal software hooks and instead use stealth hypervisors (EPT/NPT), custom IST stacks, hardware debug registers, or disabled SMEP/WP bits**. <br />
+Anti-cheats run per-core hardware register/TSS audits, `CPUID(0x40000000)` / `VMXE` / `SVME` consistency checks, and ALU-calibrated `CPUID` / `IA32_APERF` timing loops at `HIGH_LEVEL` to detect hypervisor interception and CPU security tampering. <br />
 
 </details>
 
@@ -268,11 +276,12 @@ https://github.com/user-attachments/assets/b477a50b-409b-481a-afcd-d28c1b759b6f
 - [x] Add Vulnerable Driver Blocklist Check
 - [x] Add PatchGuard Context Check
 - [x] Add `PiDDBCacheTable`, `MmUnloadedDrivers`, & `CI.dll!g_KernelHashBucketList` Forensics
-- [x] Add `HalDispatchTable`, `HalPrivateDispatchTable`, & SSDT Integrity Checks
-- [x] Add Real Synthetic NMI (`HalSendNMI`) Per-Core Stack & `IRETQ` RIP Sampling
-- [x] Add Kernel Notify, Registry, `ObRegisterCallbacks`, & ETW-TI Integrity Checks
+- [x] Add `HalDispatchTable`, `HalPrivateDispatchTable`, & SSDT / Win32k `W32pServiceTable` Integrity Checks
+- [x] Add Real Synthetic NMI (`HalSendNMI`) Per-Core Stack & `IRETQ` RIP Sampling + `KiNmiCallbackListHead` Audit
+- [x] Add Kernel Notify, Registry, BugCheck, `ObRegisterCallbacks`, `ObTypeIndexTable`, & ETW-TI / `WmipLoggerContext` Checks
 - [x] Add Live Per-Core `KPRCB` `DpcData` & `KTIMER_TABLE` Wheel Scans
-- [x] Add `MmPfnDatabase` Spoofing, Stealth Hypervisor Timing, & CPU `CR0`/`CR4`/`EFER`/`DR7` Checks
+- [x] Add `MmPfnDatabase` Spoofing, Stealth Hypervisor Timing/`CPUID`/`VMXE`/`SVME`, `KTSS64`, & CPU `CR0`/`CR4`/`EFER`/`DR7` Checks
+- [x] Add `CI.dll!g_CiOptions` DSE State, `FLTMGR.SYS` Minifilter Operations, `.data` Pointer, & HWID Spoofer Surface Audits
 
 ## Conclusion
 Undetected Easy is a **kernel detection scanner** made to find **driver detections before anti-cheats do**. <br />

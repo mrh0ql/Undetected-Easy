@@ -1441,6 +1441,449 @@ namespace device_surface {
 		return detections;
 	}
 
+	bool ascii_contains_token_insensitive( const char* haystack, const char* needle ) {
+		if ( !haystack || !needle || !needle[ 0 ] )
+			return false;
+
+		for ( auto cursor = haystack; *cursor; ++cursor ) {
+			if ( ascii_starts_with_insensitive( cursor, needle ) )
+				return true;
+		}
+
+		return false;
+	}
+
+	bool query_boot_testsigning_enabled( bool* out_allowed ) {
+		if ( !out_allowed )
+			return false;
+
+		*out_allowed = false;
+		UNICODE_STRING key_path = RTL_CONSTANT_STRING( L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control" );
+		OBJECT_ATTRIBUTES attributes{ };
+		InitializeObjectAttributes( &attributes, &key_path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr );
+
+		HANDLE key_handle = nullptr;
+		if ( !NT_SUCCESS( ZwOpenKey( &key_handle, KEY_QUERY_VALUE, &attributes ) ) || !key_handle )
+			return false;
+
+		UNICODE_STRING value_name = RTL_CONSTANT_STRING( L"SystemStartOptions" );
+		unsigned char raw_buffer[ 512 ]{ };
+		ULONG result_length = 0;
+		auto status = ZwQueryValueKey(
+			key_handle,
+			&value_name,
+			KeyValuePartialInformation,
+			raw_buffer,
+			sizeof( raw_buffer ) - sizeof( wchar_t ),
+			&result_length
+		);
+		ZwClose( key_handle );
+
+		if ( !NT_SUCCESS( status ) )
+			return false;
+
+		auto partial = reinterpret_cast< const KEY_VALUE_PARTIAL_INFORMATION* >( raw_buffer );
+		if ( partial->Type != REG_SZ || partial->DataLength < sizeof( wchar_t ) )
+			return false;
+
+		UNICODE_STRING wide_options{ };
+		wide_options.Buffer = reinterpret_cast< PWCH >( const_cast< UCHAR* >( partial->Data ) );
+		wide_options.Length = static_cast< USHORT >( partial->DataLength - sizeof( wchar_t ) );
+		wide_options.MaximumLength = static_cast< USHORT >( partial->DataLength );
+
+		char ascii_options[ 256 ]{ };
+		if ( !unicode_to_ascii( wide_options, ascii_options, sizeof( ascii_options ) ) )
+			return false;
+
+		*out_allowed =
+			ascii_contains_token_insensitive( ascii_options, "TESTSIGNING" ) ||
+			ascii_contains_token_insensitive( ascii_options, "DISABLE_INTEGRITY_CHECKS" ) ||
+			ascii_contains_token_insensitive( ascii_options, "NOINTEGRITYCHECKS" );
+		return true;
+	}
+
+	unsigned long scan_ci_dse_state( ioctl::command_t* command ) {
+		auto ci_options_va = m_entry.m_pdb.m_ci_g_ci_options;
+		if ( !command || !ci_options_va || !memory::is_canonical_kernel_address( ci_options_va ) )
+			return 0;
+
+		ULONG ci_options = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( ci_options_va ), sizeof( ci_options ), &ci_options, &copied ) )
+			return 0;
+
+		struct system_codeintegrity_info_t {
+			ULONG m_length;
+			ULONG m_options;
+		} sys_ci{ sizeof( system_codeintegrity_info_t ), 0 };
+
+		ULONG returned = 0;
+		const auto ci_status = ZwQuerySystemInformation( 103ul, &sys_ci, sizeof( sys_ci ), &returned );
+		bool boot_testsigning = false;
+		const bool have_boot_opts = query_boot_testsigning_enabled( &boot_testsigning );
+
+		const bool dse_disabled = ( ci_options & 0x6ul ) == 0 ||
+			( NT_SUCCESS( ci_status ) && ( sys_ci.m_options & 0x1ul ) == 0 && !( have_boot_opts && boot_testsigning ) );
+		const bool runtime_testsign_injected =
+			( ci_options & 0x8ul ) != 0 &&
+			have_boot_opts &&
+			!boot_testsigning &&
+			!SharedUserData->KdDebuggerEnabled;
+
+		if ( !dse_disabled && !runtime_testsign_injected )
+			return 0;
+
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"g_CiOptions=0x%lx sys_ci=0x%lx boot_testsign=%u reason=%s",
+			ci_options,
+			sys_ci.m_options,
+			boot_testsigning ? 1ul : 0ul,
+			dse_disabled ? "dse_disabled_in_memory" : "runtime_testsigning_bit_injected"
+		);
+		report::add_memory_detection(
+			command,
+			"CI.dll!g_CiOptions",
+			report::m_dse_ci_options_violation,
+			detail,
+			ci_options_va,
+			sizeof( ci_options )
+		);
+		return 1;
+	}
+
+	struct flt_operation_registration_t {
+		unsigned char m_major_function;
+		unsigned char m_padding[ 3 ];
+		unsigned long m_flags;
+		void* m_pre_operation;
+		void* m_post_operation;
+		void* m_reserved1;
+	};
+	static_assert( sizeof( flt_operation_registration_t ) == 32, "unexpected _FLT_OPERATION_REGISTRATION size" );
+
+	unsigned long check_fltmgr_operation_callback(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		unsigned long long filter_va,
+		unsigned char major_fn,
+		const char* stage,
+		void* callback_ptr ) {
+		if ( !callback_ptr )
+			return 0;
+
+		auto cb_va = reinterpret_cast< unsigned long long >( callback_ptr );
+		target_info_t info{ };
+		if ( memory::is_canonical_kernel_address( cb_va ) )
+			query_target_info( modules, cb_va, &info );
+
+		bool prologue_hooked = false;
+		unsigned long long hook_dst = 0;
+		size_t copied = 0;
+		unsigned char prologue[ 16 ]{ };
+		if ( info.m_module && memory::copy_kernel_memory( reinterpret_cast< void* >( cb_va ), sizeof( prologue ), prologue, &copied ) ) {
+			signatures::relative_branch_signature_t rel_sig{ };
+			if ( ( prologue[ 0 ] == 0xE9 || prologue[ 0 ] == 0xEB ) &&
+				signatures::match_relative_branch_signature( prologue, sizeof( prologue ), 0, cb_va, &rel_sig ) ) {
+				hook_dst = rel_sig.m_target;
+			}
+			else if ( prologue[ 0 ] == 0x48 && prologue[ 1 ] == 0xB8 && prologue[ 10 ] == 0xFF && prologue[ 11 ] == 0xE0 ) {
+				memcpy( &hook_dst, prologue + 2, sizeof( hook_dst ) );
+			}
+
+			if ( hook_dst ) {
+				target_info_t dst_info{ };
+				if ( memory::is_canonical_kernel_address( hook_dst ) )
+					query_target_info( modules, hook_dst, &dst_info );
+				if ( !dst_info.m_owner || !dst_info.m_executable || dst_info.m_bad_backing )
+					prologue_hooked = true;
+			}
+		}
+
+		if ( info.m_owner && info.m_executable && !info.m_bad_backing && !info.m_writable && !prologue_hooked )
+			return 0;
+
+		char detail[ ioctl::m_detection_text_size ]{ };
+		RtlStringCbPrintfA(
+			detail,
+			sizeof( detail ),
+			"filter=0x%llx mj=0x%x stage=%s target=0x%llx owner=%s hooked=%u",
+			filter_va,
+			static_cast< unsigned int >( major_fn ),
+			stage ? stage : "op",
+			cb_va,
+			info.m_owner ? info.m_owner : "unknown",
+			prologue_hooked ? 1ul : 0ul
+		);
+		report::add_memory_detection(
+			command,
+			"FLTMGR!FilterOperation",
+			report::m_filter_callback_violation,
+			detail,
+			cb_va,
+			sizeof( void* )
+		);
+		return 1;
+	}
+
+	unsigned long scan_fltmgr_filters( ioctl::command_t* command, const system_modules_t* modules ) {
+		auto globals_va = m_entry.m_pdb.m_flt_globals;
+		const auto& off = m_entry.m_offsets;
+		if ( !command || !modules || !globals_va || !memory::is_canonical_kernel_address( globals_va ) )
+			return 0;
+
+		if ( !off.m_flt_globals_frame_list || off.m_flt_globals_frame_list > 0x1000 ||
+			!off.m_fltp_frame_links || off.m_fltp_frame_links > 0x1000 ||
+			!off.m_fltp_frame_registered_filters || off.m_fltp_frame_registered_filters > 0x1000 ||
+			!off.m_flt_object_primary_link || off.m_flt_object_primary_link > 0x1000 ||
+			!off.m_flt_filter_driver_object || off.m_flt_filter_driver_object > 0x1000 ||
+			!off.m_flt_filter_operations || off.m_flt_filter_operations > 0x1000 )
+			return 0;
+
+		auto frame_list_head_va = globals_va + off.m_flt_globals_frame_list;
+		LIST_ENTRY frame_head{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( frame_list_head_va ), sizeof( frame_head ), &frame_head, &copied ) )
+			return 0;
+
+		auto frame_link = reinterpret_cast< unsigned long long >( frame_head.Flink );
+		if ( !memory::is_canonical_kernel_address( frame_link ) )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto frame_idx = 0ul; frame_link && frame_link != frame_list_head_va && frame_idx < 16ul; frame_idx++ ) {
+			if ( !memory::is_canonical_kernel_address( frame_link ) )
+				break;
+
+			LIST_ENTRY frame_entry{ };
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( frame_link ), sizeof( frame_entry ), &frame_entry, &copied ) )
+				break;
+
+			auto frame_va = frame_link - off.m_fltp_frame_links;
+			auto reg_head_va = frame_va + off.m_fltp_frame_registered_filters;
+			LIST_ENTRY filter_head{ };
+			if ( memory::copy_kernel_memory( reinterpret_cast< void* >( reg_head_va ), sizeof( filter_head ), &filter_head, &copied ) ) {
+				auto filter_link = reinterpret_cast< unsigned long long >( filter_head.Flink );
+				for ( auto flt_idx = 0ul; filter_link && filter_link != reg_head_va && flt_idx < 128ul; flt_idx++ ) {
+					if ( !memory::is_canonical_kernel_address( filter_link ) )
+						break;
+
+					LIST_ENTRY filter_entry{ };
+					if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( filter_link ), sizeof( filter_entry ), &filter_entry, &copied ) )
+						break;
+
+					auto filter_va = filter_link - off.m_flt_object_primary_link;
+					PDRIVER_OBJECT filter_drv = nullptr;
+					if ( memory::copy_kernel_memory(
+						reinterpret_cast< void* >( filter_va + off.m_flt_filter_driver_object ),
+						sizeof( filter_drv ),
+						&filter_drv,
+						&copied ) &&
+						filter_drv && memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( filter_drv ) ) ) {
+						DRIVER_OBJECT drv_copy{ };
+						if ( memory::copy_kernel_memory( filter_drv, sizeof( drv_copy ), &drv_copy, &copied ) && drv_copy.Type == 4 ) {
+							if ( !find_driver_owner_module( modules, &drv_copy ) ) {
+								char detail[ ioctl::m_detection_text_size ]{ };
+								RtlStringCbPrintfA(
+									detail,
+									sizeof( detail ),
+									"filter=0x%llx driver=0x%llx start=0x%llx reason=unbacked_minifilter_driver",
+									filter_va,
+									reinterpret_cast< unsigned long long >( filter_drv ),
+									reinterpret_cast< unsigned long long >( drv_copy.DriverStart )
+								);
+								report::add_memory_detection(
+									command,
+									"FLTMGR!RegisteredFilter",
+									report::m_filter_callback_violation,
+									detail,
+									filter_va,
+									sizeof( void* )
+								);
+								detections++;
+							}
+						}
+					}
+
+					unsigned long long ops_va = 0;
+					if ( memory::copy_kernel_memory(
+						reinterpret_cast< void* >( filter_va + off.m_flt_filter_operations ),
+						sizeof( ops_va ),
+						&ops_va,
+						&copied ) &&
+						ops_va && memory::is_canonical_kernel_address( ops_va ) ) {
+						for ( auto op_idx = 0ul; op_idx < 64ul; op_idx++ ) {
+							flt_operation_registration_t op{ };
+							if ( !memory::copy_kernel_memory(
+								reinterpret_cast< void* >( ops_va + op_idx * sizeof( op ) ),
+								sizeof( op ),
+								&op,
+								&copied ) )
+								break;
+
+							if ( op.m_major_function == 0x80u )
+								break;
+
+							detections += check_fltmgr_operation_callback( command, modules, filter_va, op.m_major_function, "PreOp", op.m_pre_operation );
+							detections += check_fltmgr_operation_callback( command, modules, filter_va, op.m_major_function, "PostOp", op.m_post_operation );
+						}
+					}
+
+					filter_link = reinterpret_cast< unsigned long long >( filter_entry.Flink );
+				}
+			}
+
+			frame_link = reinterpret_cast< unsigned long long >( frame_entry.Flink );
+		}
+
+		return detections;
+	}
+
+	bool is_trusted_hwid_dispatch_host( const char* module_name ) {
+		if ( !module_name )
+			return false;
+
+		return
+			ascii_equal_insensitive( module_name, "ntoskrnl.exe" ) ||
+			ascii_equal_insensitive( module_name, "CLASSPNP.SYS" ) ||
+			ascii_equal_insensitive( module_name, "storport.sys" ) ||
+			ascii_equal_insensitive( module_name, "ataport.SYS" ) ||
+			ascii_equal_insensitive( module_name, "pciidex.sys" ) ||
+			ascii_equal_insensitive( module_name, "Wdf01000.sys" ) ||
+			ascii_equal_insensitive( module_name, "ndis.sys" ) ||
+			ascii_equal_insensitive( module_name, "NETIO.SYS" ) ||
+			ascii_equal_insensitive( module_name, "fwpkclnt.sys" ) ||
+			ascii_equal_insensitive( module_name, "ACPI.sys" ) ||
+			ascii_equal_insensitive( module_name, "pci.sys" );
+	}
+
+	unsigned long scan_hwid_spoofer_surface(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		PDRIVER_OBJECT* scanned,
+		unsigned long* scanned_count ) {
+		if ( !command || !modules || !scanned || !scanned_count )
+			return 0;
+
+		constexpr const char* hwid_drivers[] = {
+			"disk", "partmgr", "mountmgr", "volmgr", "storahci", "stornvme",
+			"nvme", "EhStorClass", "iaStorAVC", "mssmbios", "acpi", "nsiproxy", "Tcpip", "NDIS"
+		};
+		constexpr unsigned long monitored_slots[] = {
+			IRP_MJ_READ,
+			IRP_MJ_DEVICE_CONTROL,
+			IRP_MJ_INTERNAL_DEVICE_CONTROL,
+			IRP_MJ_SYSTEM_CONTROL,
+			IRP_MJ_PNP
+		};
+
+		unsigned long detections = 0;
+		size_t copied = 0;
+
+		for ( auto drv_idx = 0ul; drv_idx < ARRAYSIZE( hwid_drivers ); drv_idx++ ) {
+			const auto driver_name = hwid_drivers[ drv_idx ];
+			PDRIVER_OBJECT drv = nullptr;
+			if ( !reference_driver_object( driver_name, &drv ) || !drv )
+				continue;
+
+			auto owner_mod = find_driver_owner_module( modules, drv );
+			for ( auto slot_idx = 0ul; slot_idx < ARRAYSIZE( monitored_slots ); slot_idx++ ) {
+				const auto mj = monitored_slots[ slot_idx ];
+				auto handler_va = reinterpret_cast< unsigned long long >( drv->MajorFunction[ mj ] );
+				if ( !handler_va )
+					continue;
+
+				target_info_t info{ };
+				if ( memory::is_canonical_kernel_address( handler_va ) )
+					query_target_info( modules, handler_va, &info );
+
+				const bool valid_host = info.m_module && info.m_executable && !info.m_bad_backing && !info.m_writable &&
+					( ( owner_mod && info.m_module->m_image_base == owner_mod->m_image_base ) ||
+						( is_system_module_path( info.m_module ) && is_trusted_hwid_dispatch_host( info.m_owner ) ) );
+
+				bool inline_hooked = false;
+				unsigned long long hook_dst = 0;
+				unsigned char prologue[ 24 ]{ };
+				if ( info.m_module && memory::copy_kernel_memory( reinterpret_cast< void* >( handler_va ), sizeof( prologue ), prologue, &copied ) ) {
+					signatures::relative_branch_signature_t rel_sig{ };
+					if ( ( prologue[ 0 ] == 0xE9 || prologue[ 0 ] == 0xEB ) &&
+						signatures::match_relative_branch_signature( prologue, sizeof( prologue ), 0, handler_va, &rel_sig ) ) {
+						hook_dst = rel_sig.m_target;
+					}
+					else if ( prologue[ 0 ] == 0xFF && prologue[ 1 ] == 0x25 ) {
+						long disp = 0;
+						memcpy( &disp, prologue + 2, sizeof( disp ) );
+						auto ptr_va = static_cast< unsigned long long >( static_cast< long long >( handler_va + 6 ) + disp );
+						if ( memory::is_canonical_kernel_address( ptr_va ) )
+							memory::copy_kernel_memory( reinterpret_cast< void* >( ptr_va ), sizeof( hook_dst ), &hook_dst, &copied );
+					}
+					else if ( prologue[ 0 ] == 0x48 && ( prologue[ 1 ] == 0xB8 || prologue[ 1 ] == 0xB9 ) &&
+						prologue[ 10 ] == 0xFF && ( prologue[ 11 ] == 0xE0 || prologue[ 11 ] == 0xE1 ) ) {
+						memcpy( &hook_dst, prologue + 2, sizeof( hook_dst ) );
+					}
+					else if ( prologue[ 0 ] == 0x68 && prologue[ 5 ] == 0xC7 && prologue[ 6 ] == 0x44 &&
+						prologue[ 7 ] == 0x24 && prologue[ 8 ] == 0x04 && prologue[ 13 ] == 0xC3 ) {
+						unsigned int low32 = 0;
+						unsigned int high32 = 0;
+						memcpy( &low32, prologue + 1, sizeof( low32 ) );
+						memcpy( &high32, prologue + 9, sizeof( high32 ) );
+						hook_dst = static_cast< unsigned long long >( low32 ) | ( static_cast< unsigned long long >( high32 ) << 32 );
+					}
+
+					if ( hook_dst ) {
+						target_info_t dst_info{ };
+						if ( memory::is_canonical_kernel_address( hook_dst ) )
+							query_target_info( modules, hook_dst, &dst_info );
+
+						const bool trusted_dst = dst_info.m_module && dst_info.m_executable && !dst_info.m_bad_backing &&
+							( dst_info.m_module->m_image_base == info.m_module->m_image_base ||
+								( owner_mod && dst_info.m_module->m_image_base == owner_mod->m_image_base ) ||
+								( is_system_module_path( dst_info.m_module ) && is_trusted_hwid_dispatch_host( dst_info.m_owner ) ) );
+						if ( !trusted_dst )
+							inline_hooked = true;
+					}
+				}
+
+				if ( valid_host && !inline_hooked )
+					continue;
+
+				char target[ ioctl::m_detection_target_size ]{ };
+				char detail[ ioctl::m_detection_text_size ]{ };
+				RtlStringCbPrintfA( target, sizeof( target ), "hwid!%s[mj_%lu]", driver_name, mj );
+				RtlStringCbPrintfA(
+					detail,
+					sizeof( detail ),
+					"driver=%s mj=%lu handler=0x%llx owner=%s hooked=%u hook_dst=0x%llx",
+					driver_name,
+					mj,
+					handler_va,
+					info.m_owner ? info.m_owner : "unknown",
+					inline_hooked ? 1ul : 0ul,
+					hook_dst
+				);
+				report::add_memory_detection(
+					command,
+					target,
+					report::m_hwid_spoofer_hook_violation,
+					detail,
+					handler_va,
+					sizeof( void* )
+				);
+				detections++;
+			}
+
+			auto dev_walked = 0ul;
+			for ( auto dev = drv->DeviceObject; dev && dev_walked < 128ul; dev = dev->NextDevice, dev_walked++ )
+				detections += scan_attached_stack( command, modules, driver_name, dev, scanned, scanned_count );
+
+			ObDereferenceObject( drv );
+		}
+
+		return detections;
+	}
+
 	bool scan( ioctl::command_t* command, const system_modules_t* modules ) {
 		if ( !command || !modules )
 			return false;
@@ -1478,10 +1921,13 @@ namespace device_surface {
 		detections += scan_named_driver_directory( command, modules, L"\\FileSystem\\Filters", scanned_drivers, &scanned_driver_count, &driver_objects );
 		detections += scan_pci_device_stack( command, modules, scanned_drivers, &scanned_driver_count );
 		detections += scan_ndis_filters( command, modules );
+		detections += scan_fltmgr_filters( command, modules );
+		detections += scan_hwid_spoofer_surface( command, modules, scanned_drivers, &scanned_driver_count );
 		detections += callback::scan_loaded_modules( command, modules );
 		detections += scan_mm_unloaded_drivers( command );
 		detections += scan_pi_ddb_cache_table( command );
 		detections += scan_ci_hash_bucket_list( command );
+		detections += scan_ci_dse_state( command );
 
 		utility::print(
 			"device surface: modules=%lu resolved_drivers=%lu driver_objects=%lu detections=%lu\n",

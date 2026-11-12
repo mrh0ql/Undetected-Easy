@@ -109,6 +109,14 @@ namespace report {
 	constexpr const char* m_physical_memory_section_violation = "suspicious physicalmemory section dacl or kuser mapping";
 	constexpr const char* m_thread_anomaly_violation = "kernel thread spoofed start address or debug state";
 	constexpr const char* m_filter_callback_violation = "filesystem or ndis filter handler outside trusted code";
+	constexpr const char* m_dse_ci_options_violation = "code integrity g_cioptions dse state tampered";
+	constexpr const char* m_nmi_callback_violation = "registered nmi callback routine outside trusted code";
+	constexpr const char* m_bugcheck_callback_violation = "bugcheck callback routine outside trusted code";
+	constexpr const char* m_infinity_hook_etw_violation = "etw wmi logger getcpuclock syscall hook tampered";
+	constexpr const char* m_kernel_data_pointer_violation = "kernel .data function pointer redirected";
+	constexpr const char* m_object_type_hook_violation = "object type initializer procedure hooked";
+	constexpr const char* m_hwid_spoofer_hook_violation = "storage or network hwid dispatch routine hooked";
+	constexpr const char* m_tss_ist_stack_violation = "processor ktss64 rsp0 or ist stack pointer tampered";
 	constexpr bool m_report_generic_code_changes = false;
 
 	const char* violation_name_for_branch_signature( const char* signature_type ) {

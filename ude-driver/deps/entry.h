@@ -32,6 +32,15 @@ struct entry_t {
         std::uint64_t m_ci_hash_cache_lock;
         std::uint64_t m_flt_globals;
         std::uint64_t m_ndis_global_filter_list;
+        std::uint64_t m_ci_g_ci_options;
+        std::uint64_t m_ki_nmi_callback_list_head;
+        std::uint64_t m_ke_bugcheck_callback_list_head;
+        std::uint64_t m_ke_bugcheck_reason_callback_list_head;
+        std::uint64_t m_wmip_logger_context;
+        std::uint64_t m_kd_enumerate_debugging_devices;
+        std::uint64_t m_se_validate_image_header;
+        std::uint64_t m_se_validate_image_data;
+        std::uint64_t m_ob_type_index_table;
     } m_pdb;
 
     struct offsets_t {
@@ -46,6 +55,16 @@ struct entry_t {
         std::uint64_t m_mmpfn_size;
         std::uint64_t m_mmpfn_pte_address;
         std::uint64_t m_mmpfn_u4;
+        std::uint64_t m_wmi_logger_get_cpu_clock;
+        std::uint64_t m_object_type_name;
+        std::uint64_t m_object_type_type_info;
+        std::uint64_t m_object_type_init_dump_proc;
+        std::uint64_t m_flt_globals_frame_list;
+        std::uint64_t m_fltp_frame_links;
+        std::uint64_t m_fltp_frame_registered_filters;
+        std::uint64_t m_flt_object_primary_link;
+        std::uint64_t m_flt_filter_driver_object;
+        std::uint64_t m_flt_filter_operations;
     } m_offsets;
 
     std::uint64_t m_image_base;
@@ -53,5 +72,5 @@ struct entry_t {
     std::uint64_t m_ntoskrnl_base;
     std::uint64_t m_directory_table_base;
 };
-static_assert( sizeof( entry_t ) == 360, "entry_t layout must match service::driver_config_t" );
+static_assert( sizeof( entry_t ) == 512, "entry_t layout must match service::driver_config_t" );
 entry_t m_entry{ };

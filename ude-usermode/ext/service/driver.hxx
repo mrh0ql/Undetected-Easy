@@ -33,6 +33,15 @@ namespace service {
 			std::uint64_t m_ci_hash_cache_lock;
 			std::uint64_t m_flt_globals;
 			std::uint64_t m_ndis_global_filter_list;
+			std::uint64_t m_ci_g_ci_options;
+			std::uint64_t m_ki_nmi_callback_list_head;
+			std::uint64_t m_ke_bugcheck_callback_list_head;
+			std::uint64_t m_ke_bugcheck_reason_callback_list_head;
+			std::uint64_t m_wmip_logger_context;
+			std::uint64_t m_kd_enumerate_debugging_devices;
+			std::uint64_t m_se_validate_image_header;
+			std::uint64_t m_se_validate_image_data;
+			std::uint64_t m_ob_type_index_table;
 		} m_pdb;
 
 		struct offsets_t {
@@ -47,6 +56,16 @@ namespace service {
 			std::uint64_t m_mmpfn_size;
 			std::uint64_t m_mmpfn_pte_address;
 			std::uint64_t m_mmpfn_u4;
+			std::uint64_t m_wmi_logger_get_cpu_clock;
+			std::uint64_t m_object_type_name;
+			std::uint64_t m_object_type_type_info;
+			std::uint64_t m_object_type_init_dump_proc;
+			std::uint64_t m_flt_globals_frame_list;
+			std::uint64_t m_fltp_frame_links;
+			std::uint64_t m_fltp_frame_registered_filters;
+			std::uint64_t m_flt_object_primary_link;
+			std::uint64_t m_flt_filter_driver_object;
+			std::uint64_t m_flt_filter_operations;
 		} m_offsets;
 
 		std::uint64_t m_image_base;
@@ -54,7 +73,7 @@ namespace service {
 		std::uint64_t m_ntoskrnl_base;
 		std::uint64_t m_directory_table_base;
 	};
-	static_assert( sizeof( driver_config_t ) == 360, "driver_config_t layout must match entry_t" );
+	static_assert( sizeof( driver_config_t ) == 512, "driver_config_t layout must match entry_t" );
 
 	class c_service {
 	public:
@@ -336,6 +355,14 @@ namespace service {
 			config.m_pdb.m_mm_pfn_database = g_pdb->get_symbol_address( obf( "MmPfnDatabase" ) );
 			config.m_pdb.m_etw_threat_int_prov_reg_handle = g_pdb->get_symbol_address( obf( "EtwThreatIntProvRegHandle" ) );
 			config.m_pdb.m_hal_send_nmi = g_pdb->get_symbol_address( obf( "HalSendNMI" ) );
+			config.m_pdb.m_ki_nmi_callback_list_head = g_pdb->get_symbol_address( obf( "KiNmiCallbackListHead" ) );
+			config.m_pdb.m_ke_bugcheck_callback_list_head = g_pdb->get_symbol_address( obf( "KeBugCheckCallbackListHead" ) );
+			config.m_pdb.m_ke_bugcheck_reason_callback_list_head = g_pdb->get_symbol_address( obf( "KeBugCheckReasonCallbackListHead" ) );
+			config.m_pdb.m_wmip_logger_context = g_pdb->get_symbol_address( obf( "WmipLoggerContext" ) );
+			config.m_pdb.m_kd_enumerate_debugging_devices = g_pdb->get_symbol_address( obf( "KdEnumerateDebuggingDevices" ) );
+			config.m_pdb.m_se_validate_image_header = g_pdb->get_symbol_address( obf( "SeValidateImageHeader" ) );
+			config.m_pdb.m_se_validate_image_data = g_pdb->get_symbol_address( obf( "SeValidateImageData" ) );
+			config.m_pdb.m_ob_type_index_table = g_pdb->get_symbol_address( obf( "ObTypeIndexTable" ) );
 
 			config.m_offsets.m_kprcb_timer_table = g_pdb->get_struct_member( obf( "_KPRCB" ), obf( "TimerTable" ) );
 			config.m_offsets.m_kprcb_dpc_data = g_pdb->get_struct_member( obf( "_KPRCB" ), obf( "DpcData" ) );
@@ -350,18 +377,40 @@ namespace service {
 			config.m_offsets.m_mmpfn_size = g_pdb->get_struct_size( obf( "_MMPFN" ) );
 			config.m_offsets.m_mmpfn_pte_address = g_pdb->get_struct_member( obf( "_MMPFN" ), obf( "PteAddress" ) );
 			config.m_offsets.m_mmpfn_u4 = g_pdb->get_struct_member( obf( "_MMPFN" ), obf( "u4" ) );
+			config.m_offsets.m_wmi_logger_get_cpu_clock = g_pdb->get_struct_member( obf( "_WMI_LOGGER_CONTEXT" ), obf( "GetCpuClock" ) );
+			config.m_offsets.m_object_type_name = g_pdb->get_struct_member( obf( "_OBJECT_TYPE" ), obf( "Name" ) );
+			config.m_offsets.m_object_type_type_info = g_pdb->get_struct_member( obf( "_OBJECT_TYPE" ), obf( "TypeInfo" ) );
+			config.m_offsets.m_object_type_init_dump_proc = g_pdb->get_struct_member( obf( "_OBJECT_TYPE_INITIALIZER" ), obf( "DumpProcedure" ) );
 
 			{
 				pdb::c_pdb ci_pdb( obf( "CI.dll" ) );
 				if ( ci_pdb.load( ) ) {
 					config.m_pdb.m_ci_kernel_hash_bucket_list = ci_pdb.get_symbol_address( obf( "g_KernelHashBucketList" ) );
 					config.m_pdb.m_ci_hash_cache_lock = ci_pdb.get_symbol_address( obf( "g_HashCacheLock" ) );
+					config.m_pdb.m_ci_g_ci_options = ci_pdb.get_symbol_address( obf( "g_CiOptions" ) );
 				}
 			}
 			{
 				pdb::c_pdb flt_pdb( obf( "drivers\\FLTMGR.SYS" ) );
-				if ( flt_pdb.load( ) )
+				if ( flt_pdb.load( ) ) {
 					config.m_pdb.m_flt_globals = flt_pdb.get_symbol_address( obf( "FltGlobals" ) );
+					auto rlist_off = flt_pdb.get_struct_member( obf( "_FLT_RESOURCE_LIST_HEAD" ), obf( "rList" ) );
+					if ( !rlist_off )
+						rlist_off = 0x68;
+					auto frame_list = flt_pdb.get_struct_member( obf( "_GLOBALS" ), obf( "FrameList" ) );
+					if ( frame_list || flt_pdb.get_struct_size( obf( "_GLOBALS" ) ) )
+						config.m_offsets.m_flt_globals_frame_list = frame_list + rlist_off;
+					config.m_offsets.m_fltp_frame_links = flt_pdb.get_struct_member( obf( "_FLTP_FRAME" ), obf( "Links" ) );
+					auto reg_filters = flt_pdb.get_struct_member( obf( "_FLTP_FRAME" ), obf( "RegisteredFilters" ) );
+					if ( reg_filters )
+						config.m_offsets.m_fltp_frame_registered_filters = reg_filters + rlist_off;
+					auto flt_base = flt_pdb.get_struct_member( obf( "_FLT_FILTER" ), obf( "Base" ) );
+					auto prim_link = flt_pdb.get_struct_member( obf( "_FLT_OBJECT" ), obf( "PrimaryLink" ) );
+					if ( prim_link )
+						config.m_offsets.m_flt_object_primary_link = flt_base + prim_link;
+					config.m_offsets.m_flt_filter_driver_object = flt_pdb.get_struct_member( obf( "_FLT_FILTER" ), obf( "DriverObject" ) );
+					config.m_offsets.m_flt_filter_operations = flt_pdb.get_struct_member( obf( "_FLT_FILTER" ), obf( "Operations" ) );
+				}
 			}
 			{
 				pdb::c_pdb ndis_pdb( obf( "drivers\\ndis.sys" ) );

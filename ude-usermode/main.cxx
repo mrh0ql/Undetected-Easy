@@ -68,6 +68,9 @@ bool is_known_false_positive( const driver::detection_t& detection ) {
 const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	auto type = detection.m_type;
 
+	if ( contains_insensitive( type, ".data function pointer" ) )
+		return obf( "we detected a swapped kernel .data function pointer (KdEnumerateDebuggingDevices / SeValidateImageHeader / SeValidateImageData); restore original ntoskrnl/CI.dll pointers." );
+
 	if ( contains_insensitive( type, "redirect" ) || contains_insensitive( type, "code section modified" ) )
 		return obf( "your hooks shellcode was visible; use a rop chain or shadow paging to hide your shellcode." );
 
@@ -95,11 +98,14 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "non-code section" ) || contains_insensitive( type, "outside executable section" ) )
 		return obf( "we detected memory execution from code sections; do not execute from outside executable sections." );
 
+	if ( contains_insensitive( type, "ktss64" ) )
+		return obf( "we detected a tampered per-core KTSS64 Rsp0 or IST1-7 interrupt stack pointer; keep hardware TSS stack pointers in resident supervisor-only NX kernel memory." );
+
 	if ( contains_insensitive( type, "stack pointer" ) || contains_insensitive( type, "stack owner chain" ) || contains_insensitive( type, "stack frame" ) )
 		return obf( "we detected stack pivots and synthetic frames; keep normal call flow and unwindable frames inside trusted executable code." );
 
 	if ( contains_insensitive( type, "spoofed start address" ) )
-		return obf( "we detected a system thread with a spoofed _ETHREAD.StartAddress or active debug state; create threads legitimately inside signed module code without tampering ETHREAD fields." );
+		return obf( "we detected a system thread with a spoofed _ETHREAD.StartAddress, cleared SystemThread DKOM flag, or active DR7 state; do not tamper ETHREAD fields." );
 
 	if ( contains_insensitive( type, "thread start" ) )
 		return obf( "we detected bad system threads; do not execute from outside executable sections or any memory outside of loaded modules." );
@@ -125,6 +131,9 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "loaded module list entry" ) )
 		return obf( "we detected a loaded-module entry that does not line up with a normal driver image/object; load the driver through the normal service path." );
 
+	if ( contains_insensitive( type, "g_cioptions" ) )
+		return obf( "we detected CI.dll!g_CiOptions DSE state tampering (disabled DSE or runtime-injected testsigning bit); restore original g_CiOptions immediately after driver load." );
+
 	if ( contains_insensitive( type, "kernelhashbucketlist" ) )
 		return obf( "we detected a blocked or tampered driver entry in CI.dll!g_KernelHashBucketList; clear vulnerable driver load traces without leaving zeroed hash buckets." );
 
@@ -134,17 +143,32 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	if ( contains_insensitive( type, "piddbcachetable" ) || contains_insensitive( type, "mmunloadeddrivers" ) )
 		return obf( "we detected driver load history traces or malformed entries in PiDDBCacheTable / MmUnloadedDrivers; sanitize the entry while preserving valid list links and timestamps." );
 
+	if ( contains_insensitive( type, "registered nmi callback" ) )
+		return obf( "we detected a rogue or anti-NMI blocker callback in KiNmiCallbackListHead; deregister unauthorized KeRegisterNmiCallback handlers." );
+
+	if ( contains_insensitive( type, "bugcheck callback" ) )
+		return obf( "we detected an unbacked KeBugCheckCallbackListHead or KeBugCheckReasonCallbackListHead routine; deregister unauthorized bugcheck callbacks." );
+
+	if ( contains_insensitive( type, "object type initializer" ) )
+		return obf( "we detected a hooked _OBJECT_TYPE_INITIALIZER procedure in ObTypeIndexTable (Open/Close/Delete/ParseProcedure); restore unmodified object type procedures." );
+
 	if ( contains_insensitive( type, "kernel notify" ) || contains_insensitive( type, "object callback" ) )
 		return obf( "we detected a process/thread/image notify routine, registry callback, or ObRegisterCallbacks handler pointing outside signed modules; register callbacks only inside backed driver code." );
 
+	if ( contains_insensitive( type, "hwid dispatch" ) )
+		return obf( "we detected a redirected or inline-hooked storage, SMBIOS, or network HWID dispatch handler (disk/partmgr/mountmgr/stornvme/nsiproxy); restore clean MajorFunction routines." );
+
 	if ( contains_insensitive( type, "filter handler" ) )
-		return obf( "we detected an unbacked filesystem, PCI, or NDIS filter device/handler attached to a kernel stack; detach unauthorized filter devices and restore backed dispatch routines." );
+		return obf( "we detected an unbacked FLTMGR minifilter, filesystem, PCI, or NDIS filter handler attached to a kernel stack; detach unauthorized filters and restore backed callbacks." );
+
+	if ( contains_insensitive( type, "wmi logger getcpuclock" ) )
+		return obf( "we detected an InfinityHook-style _WMI_LOGGER_CONTEXT.GetCpuClock function pointer swap in WmipLoggerContext; restore the default ETW clock routine." );
 
 	if ( contains_insensitive( type, "etw threat intelligence" ) )
 		return obf( "we detected tampering or blinding on EtwThreatIntProvRegHandle; restore the intact ETW Threat Intelligence registration state." );
 
 	if ( contains_insensitive( type, "ssdt" ) )
-		return obf( "we detected an SSDT entry pointing outside ntoskrnl or patched with an inline hook; restore unmodified KeServiceDescriptorTable routines." );
+		return obf( "we detected a KeServiceDescriptorTable or Win32k W32pServiceTable SSDT entry pointing outside system modules or patched with an inline hook; restore clean service tables." );
 
 	if ( contains_insensitive( type, "hal dispatch" ) )
 		return obf( "we detected a modified HalDispatchTable or HalPrivateDispatchTable pointer; restore all HAL dispatch pointers to trusted system modules." );
@@ -159,7 +183,7 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 		return obf( "we detected active kernel hardware debug registers (DR0-DR3 / DR7); clear hardware breakpoints on all logical processors." );
 
 	if ( contains_insensitive( type, "hypervisor" ) || contains_insensitive( type, "tsc discrepancy" ) )
-		return obf( "we detected stealth hypervisor VM-exit timing inflation or TSC/IA32_APERF offsetting skew; ensure accurate TSC scaling and MPPERF/APERF passthrough." );
+		return obf( "we detected stealth hypervisor VM-exit timing, ALU-vs-CPUID TSC_OFFSET over-subtraction, leaked CPUID 0x40000000 leaf, or unshadowed CR4.VMXE / EFER.SVME bits." );
 
 	if ( contains_insensitive( type, "dispatch" ) || contains_insensitive( type, "device object" ) || contains_insensitive( type, "driver object" ) )
 		return obf( "we detected modified driver/device objects; keep dispatch pointers inside the owning driver's executable sections." );

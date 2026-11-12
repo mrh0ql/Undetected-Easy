@@ -148,11 +148,36 @@ namespace execution::thread {
 
 		unsigned long detections = 0;
 		const auto thread_va = reinterpret_cast< unsigned long long >( ethread );
+		const auto owner_proc = PsGetThreadProcess( ethread );
+		const auto real_pid = owner_proc ? PsGetProcessId( owner_proc ) : pid;
+		const auto is_pid4 = real_pid == reinterpret_cast< HANDLE >( 4ull );
 		const auto is_system_thread = PsIsSystemThread( ethread ) != FALSE;
+
+		if ( is_pid4 && !is_system_thread ) {
+			char detail[ ioctl::m_detection_text_size ]{ };
+			RtlStringCbPrintfA(
+				detail,
+				sizeof( detail ),
+				"pid=4 tid=0x%llx ethread=0x%llx reason=system_thread_flag_cleared_dkom",
+				reinterpret_cast< unsigned long long >( tid ),
+				thread_va
+			);
+			auto before = command->m_total_detection_count;
+			report::add_execution_detection(
+				command,
+				"thread!system_flag_dkom",
+				report::m_thread_anomaly_violation,
+				detail,
+				thread_va,
+				sizeof( void* )
+			);
+			if ( command->m_total_detection_count != before )
+				detections++;
+		}
 
 		unsigned char dispatcher_header[ 4 ]{ };
 		size_t copied = 0;
-		if ( is_system_thread &&
+		if ( ( is_system_thread || is_pid4 ) &&
 			memory::copy_kernel_memory( ethread, sizeof( dispatcher_header ), dispatcher_header, &copied ) &&
 			( dispatcher_header[ 3 ] & 0x01u ) != 0 &&
 			!SharedUserData->KdDebuggerEnabled ) {
@@ -161,7 +186,7 @@ namespace execution::thread {
 				detail,
 				sizeof( detail ),
 				"pid=0x%llx tid=0x%llx ethread=0x%llx debug_active=0x%x reason=system_thread_active_dr7",
-				reinterpret_cast< unsigned long long >( pid ),
+				reinterpret_cast< unsigned long long >( real_pid ),
 				reinterpret_cast< unsigned long long >( tid ),
 				thread_va,
 				static_cast< unsigned long >( dispatcher_header[ 3 ] )
@@ -179,7 +204,7 @@ namespace execution::thread {
 				detections++;
 		}
 
-		if ( is_system_thread && m_entry.m_offsets.m_kthread_start_address && m_entry.m_offsets.m_kthread_start_address < 0x1000 ) {
+		if ( ( is_system_thread || is_pid4 ) && m_entry.m_offsets.m_kthread_start_address && m_entry.m_offsets.m_kthread_start_address < 0x1000 ) {
 			unsigned long long internal_start = 0;
 			if ( memory::copy_kernel_memory(
 				reinterpret_cast< void* >( thread_va + m_entry.m_offsets.m_kthread_start_address ),
@@ -196,7 +221,7 @@ namespace execution::thread {
 						detail,
 						sizeof( detail ),
 						"pid=0x%llx tid=0x%llx ethread_start=0x%llx query_start=0x%llx reason=unbacked_ethread_start",
-						reinterpret_cast< unsigned long long >( pid ),
+						reinterpret_cast< unsigned long long >( real_pid ),
 						reinterpret_cast< unsigned long long >( tid ),
 						internal_start,
 						query_start
@@ -217,6 +242,52 @@ namespace execution::thread {
 		}
 
 		ObDereferenceObject( ethread );
+		return detections;
+	}
+
+	bool is_tid_in_snapshot( const void* buffer, HANDLE target_tid ) {
+		if ( !buffer || !target_tid )
+			return false;
+
+		auto process = static_cast< const system_process_information_t* >( buffer );
+		while ( process ) {
+			auto threads = reinterpret_cast< const system_thread_information_t* >( process + 1 );
+			for ( auto i = 0ul; i < process->m_thread_count; i++ ) {
+				if ( threads[ i ].m_client_id.UniqueThread == target_tid )
+					return true;
+			}
+			if ( !process->m_next_entry_offset )
+				break;
+			process = reinterpret_cast< const system_process_information_t* >(
+				reinterpret_cast< const unsigned char* >( process ) + process->m_next_entry_offset );
+		}
+		return false;
+	}
+
+	unsigned long scan_cid_system_threads(
+		ioctl::command_t* command,
+		const system_modules_t* modules,
+		const void* snapshot_buffer ) {
+		if ( !command || !modules )
+			return 0;
+
+		unsigned long detections = 0;
+		for ( auto tid_val = 4ull; tid_val < 0x10000ull; tid_val += 4ull ) {
+			auto tid = reinterpret_cast< HANDLE >( tid_val );
+			PETHREAD ethread = nullptr;
+			if ( !NT_SUCCESS( PsLookupThreadByThreadId( tid, &ethread ) ) || !ethread )
+				continue;
+
+			const auto owner_proc = PsGetThreadProcess( ethread );
+			const auto pid = owner_proc ? PsGetProcessId( owner_proc ) : nullptr;
+			const bool is_sys = ( PsIsSystemThread( ethread ) != FALSE ) || ( pid == reinterpret_cast< HANDLE >( 4ull ) );
+			ObDereferenceObject( ethread );
+
+			if ( !is_sys || is_tid_in_snapshot( snapshot_buffer, tid ) )
+				continue;
+
+			detections += inspect_ethread_anomalies( command, modules, pid, tid, 0 );
+		}
 		return detections;
 	}
 
@@ -313,6 +384,7 @@ namespace execution::thread {
 			);
 		}
 
+		detections += scan_cid_system_threads( command, modules, buffer );
 		memory::free_pool( buffer );
 		return detections;
 	}
