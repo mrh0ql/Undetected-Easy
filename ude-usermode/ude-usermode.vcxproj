@@ -74,8 +74,8 @@
     <OutDir>..\builds\</OutDir>
     <IntDir>..\builds\intermediate\</IntDir>
     <IncludePath>.\;$(IncludePath)</IncludePath>
-    <ExternalIncludePath>C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\include;$(ExternalIncludePath)</ExternalIncludePath>
-    <LibraryPath>C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\lib\arm64;$(LibraryPath)</LibraryPath>
+    <ExternalIncludePath>$(VSInstallDir)DIA SDK\include;$(ExternalIncludePath)</ExternalIncludePath>
+    <LibraryPath>$(VSInstallDir)DIA SDK\lib\amd64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -131,7 +131,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalDependencies>diaguids.lib;ws2_32.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>C:\Program Files\Microsoft Visual Studio\2022\Professional\DIA SDK\lib\amd64</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(VSInstallDir)DIA SDK\lib\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

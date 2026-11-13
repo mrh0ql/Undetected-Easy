@@ -1,0 +1,157 @@
+name: Build UDE (Release x64)
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'builds/**'
+      - 'README.md'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build ude-usermode.exe (Release | x64)
+        shell: pwsh
+        run: |
+          msbuild ude-usermode\ude-usermode.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $vsDir = vswhere -latest -products * -property installationPath
+          $msdia = Join-Path $vsDir "DIA SDK\bin\amd64\msdia140.dll"
+          if (Test-Path $msdia) {
+            Copy-Item $msdia -Destination "builds\msdia140.dll" -Force
+            Write-Host "Bundled msdia140.dll from $msdia"
+          }
+
+      - name: Build & Test-Sign ude-driver.sys (Release | x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "builds\intermediate" | Out-Null
+
+          # Check if WDK km headers/libs exist on runner; otherwise pull official Microsoft.Windows.WDK.x64 NuGet package
+          $ntddk = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Include" -Filter "ntddk.h" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ntddk) {
+            Write-Host "Installing Microsoft.Windows.WDK.x64 NuGet package..."
+            $wdkRoot = Join-Path $env:RUNNER_TEMP "wdk_pkg"
+            nuget install Microsoft.Windows.WDK.x64 -OutputDirectory $wdkRoot -NonInteractive
+            $ntddk = Get-ChildItem -Path $wdkRoot -Filter "ntddk.h" -Recurse | Select-Object -First 1
+          }
+          if (-not $ntddk) {
+            throw "Failed to locate ntddk.h"
+          }
+
+          $kmInc = $ntddk.Directory.FullName
+          $verIncRoot = $ntddk.Directory.Parent.FullName
+          $sharedInc = Join-Path $verIncRoot "shared"
+          $kmCrtInc = Join-Path $kmInc "crt"
+
+          $ntosLib = Get-ChildItem -Path $ntddk.Directory.Parent.Parent.Parent.FullName -Filter "ntoskrnl.lib" -Recurse | Where-Object { $_.FullName -match "km\\x64" } | Select-Object -First 1
+          if (-not $ntosLib) {
+            throw "Failed to locate km\x64\ntoskrnl.lib"
+          }
+          $kmLib = $ntosLib.Directory.FullName
+
+          Write-Host "Using WDK km include: $kmInc"
+          Write-Host "Using WDK km x64 lib: $kmLib"
+
+          $clArgs = @(
+            "/c",
+            "/nologo",
+            "/Zi",
+            "/Fdbuilds\intermediate\ude-driver.pdb",
+            "/W0",
+            "/O2",
+            "/Oi",
+            "/Oy-",
+            "/GF",
+            "/Zp8",
+            "/GS-",
+            "/Gy",
+            "/fp:precise",
+            "/Zc:wchar_t-",
+            "/Zc:forScope",
+            "/Zc:inline",
+            "/GR-",
+            "/std:c++latest",
+            "/kernel",
+            "/Iude-driver",
+            "/I$kmInc",
+            "/I$sharedInc",
+            "/I$kmCrtInc",
+            "/D_WIN64",
+            "/D_AMD64_",
+            "/DAMD64",
+            "/DCONDITION_HANDLING=1",
+            "/DNT_UP=1",
+            "/DNT_INST=0",
+            "/DWIN32=100",
+            "/D_NT1X_=100",
+            "/DWINNT=1",
+            "/D_WIN32_WINNT=0x0A00",
+            "/DWINVER=0x0A00",
+            "/D_WIN32_IE=0x0A00",
+            "/DWIN32_LEAN_AND_MEAN=1",
+            "/DDEVL=1",
+            "/DNDEBUG",
+            "/DNTDDI_VERSION=0x0A00000C",
+            "/Fobuilds\intermediate\entrypoint.obj",
+            "ude-driver\entrypoint.cxx"
+          )
+          & cl.exe @clArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $linkArgs = @(
+            "/NOLOGO",
+            "/DRIVER",
+            "/KERNEL",
+            "/NODEFAULTLIB",
+            "/SUBSYSTEM:NATIVE,10.00",
+            "/MACHINE:X64",
+            "/OPT:REF",
+            "/OPT:ICF",
+            "/INCREMENTAL:NO",
+            "/RELEASE",
+            "/MERGE:_TEXT=.text;_PAGE=PAGE",
+            "/SECTION:INIT,d",
+            "/ENTRY:entry_point",
+            "/LIBPATH:$kmLib",
+            "ntoskrnl.lib",
+            "hal.lib",
+            "/OUT:builds\ude-driver.sys",
+            "builds\intermediate\entrypoint.obj"
+          )
+          & link.exe @linkArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Create SHA-256 test certificate and test-sign ude-driver.sys
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=UDE Local Diagnostic Test Cert" -CertStoreLocation "Cert:\CurrentUser\My" -HashAlgorithm SHA256 -KeyLength 2048
+          Export-Certificate -Cert $cert -FilePath "builds\ude-test.cer" | Out-Null
+
+          $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1
+          & $signtool.FullName sign /fd SHA256 /s My /sha1 $cert.Thumbprint "builds\ude-driver.sys"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage clean builds directory
+        shell: pwsh
+        run: |
+          Remove-Item -Path "builds\intermediate" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "builds\*.pdb", "builds\*.iobj", "builds\*.ipdb", "builds\*.ilk" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "builds" -Recurse | Select-Object FullName, Length
+
+      - name: Upload builds artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ude-builds-x64
+          path: builds/**
+          if-no-files-found: error

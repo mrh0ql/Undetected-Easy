@@ -8,7 +8,7 @@ void driver_unload( PDRIVER_OBJECT driver_object ) {
 	utility::print( "unloaded ioctl\n" );
 }
 
-NTSTATUS entry_point( PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path ) {
+extern "C" NTSTATUS entry_point( PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path ) {
 	if ( !driver_object || !registry_path )
 		return STATUS_INVALID_PARAMETER;
 

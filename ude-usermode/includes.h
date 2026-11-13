@@ -35,10 +35,6 @@
 #include <aclapi.h>
 #include <winevt.h>
 #include <shared_mutex>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
-#include <curl/curl.h>
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "diaguids.lib")
 #pragma comment(lib, "Urlmon.lib")
