@@ -7,8 +7,10 @@ namespace memory {
 
 	template < typename type_t >
 	type_t allocate_pages( std::size_t size ) {
-		typedef void* function_t( std::uint64_t, int, std::uint64_t, unsigned int );
-		auto base_address = reinterpret_cast< function_t* >( m_entry.m_pdb.m_mm_allocate_independent_pages )( size, -1, 0, 0 );
+		if ( !size )
+			return { };
+
+		auto base_address = allocate_pool< void* >( size, NonPagedPool );
 		if ( !base_address )
 			return { };
 
@@ -17,8 +19,9 @@ namespace memory {
 	}
 
 	void free_pages( std::uint64_t base_address, std::size_t size ) {
-		typedef void function_t( std::uint64_t, int );
-		reinterpret_cast< function_t* >( m_entry.m_pdb.m_mm_free_independent_pages )( base_address, size );
+		UNREFERENCED_PARAMETER( size );
+		if ( base_address )
+			free_pool( reinterpret_cast< void* >( base_address ) );
 	}
 
 	bool copy_kernel_memory( void* source, size_t size, void* destination, size_t* bytes_copied ) {

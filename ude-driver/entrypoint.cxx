@@ -19,8 +19,7 @@ extern "C" NTSTATUS entry_point( PDRIVER_OBJECT driver_object, PUNICODE_STRING r
 		return STATUS_UNSUCCESSFUL;
 	}
 
-	paging::m_directory_table_base = *reinterpret_cast< std::uint64_t* >( 
-		reinterpret_cast< std::uint64_t >( PsInitialSystemProcess ) + 0x28 );
+	paging::m_directory_table_base = __readcr3( ) & ~0xFFFull;
 	if ( !paging::remap::initialize( ) ) {
 		utility::print( "failed to initialize remap.\n" );
 		memory::pool::cleanup( );

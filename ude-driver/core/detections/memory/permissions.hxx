@@ -656,10 +656,10 @@ namespace memory_scan::permissions {
 			pfn_pte_va != expected_pte_va ) {
 			reason = "mmpfn_pte_mismatch";
 		}
-		else if ( memory::is_canonical_kernel_address( m_entry.m_pdb.m_mi_is_page_on_bad_list ) ) {
-			using mi_is_page_on_bad_list_t = unsigned char( __fastcall* )( void* );
-			auto is_bad = reinterpret_cast< mi_is_page_on_bad_list_t >( m_entry.m_pdb.m_mi_is_page_on_bad_list );
-			if ( is_bad( reinterpret_cast< void* >( mmpfn_va ) ) != 0 )
+		else if ( m_entry.m_offsets.m_mmpfn_u4 &&
+			m_entry.m_offsets.m_mmpfn_u4 + sizeof( unsigned char ) <= mmpfn_size ) {
+			const auto page_location = mmpfn_bytes[ m_entry.m_offsets.m_mmpfn_u4 ] & 0x07u;
+			if ( page_location == 7u )
 				reason = "mmpfn_on_bad_page_list";
 		}
 

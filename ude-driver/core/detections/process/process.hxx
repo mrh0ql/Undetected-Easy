@@ -298,8 +298,15 @@ namespace process_integrity {
 		if ( !process )
 			return 0;
 
-		auto bytes = reinterpret_cast< unsigned char* >( process );
-		auto directory_table_base = *reinterpret_cast< unsigned long long* >( bytes + m_kprocess_directory_table_base_offset );
+		unsigned long long directory_table_base = 0;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory(
+			reinterpret_cast< unsigned char* >( process ) + m_kprocess_directory_table_base_offset,
+			sizeof( directory_table_base ),
+			&directory_table_base,
+			&copied ) )
+			return 0;
+
 		return directory_table_base & ~0xfffull;
 	}
 

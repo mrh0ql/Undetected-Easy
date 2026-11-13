@@ -69,11 +69,14 @@ namespace execution::processor {
 	}
 
 	void scan_resident_stack_page( unsigned long long start_rsp, processor_sample_t* sample, bool look_for_iretq ) {
-		if ( !sample || !memory::is_canonical_kernel_address( start_rsp ) )
+		if ( !sample || !memory::is_canonical_kernel_address( start_rsp ) ||
+			!MmIsAddressValid( reinterpret_cast< void* >( start_rsp ) ) )
 			return;
 
 		auto aligned_rsp = ( start_rsp + 7ull ) & ~7ull;
 		auto page_end = ( start_rsp & ~0xfffull ) + PAGE_SIZE;
+		if ( !MmIsAddressValid( reinterpret_cast< void* >( page_end - sizeof( unsigned long long ) ) ) )
+			return;
 
 		if ( look_for_iretq ) {
 			for ( auto cursor = aligned_rsp; cursor + 5 * sizeof( unsigned long long ) <= page_end; cursor += sizeof( unsigned long long ) ) {
@@ -101,7 +104,8 @@ namespace execution::processor {
 		auto frame_cursor = aligned_rsp;
 		auto frame_page_end = page_end;
 		if ( sample->m_interrupted_context &&
-			MmIsAddressValid( reinterpret_cast< void* >( sample->m_rsp ) ) ) {
+			MmIsAddressValid( reinterpret_cast< void* >( sample->m_rsp ) ) &&
+			MmIsAddressValid( reinterpret_cast< void* >( ( ( sample->m_rsp & ~0xfffull ) + PAGE_SIZE ) - sizeof( unsigned long long ) ) ) ) {
 			frame_cursor = ( sample->m_rsp + 7ull ) & ~7ull;
 			frame_page_end = ( sample->m_rsp & ~0xfffull ) + PAGE_SIZE;
 		}
@@ -214,8 +218,6 @@ namespace execution::processor {
 		auto ke_init_affinity = reinterpret_cast< ke_initialize_affinity_ex_t >( MmGetSystemRoutineAddress( &init_affinity_name ) );
 		auto ke_add_affinity = reinterpret_cast< ke_add_processor_affinity_ex_t >( MmGetSystemRoutineAddress( &add_affinity_name ) );
 		auto hal_send_nmi = reinterpret_cast< hal_send_nmi_t >( MmGetSystemRoutineAddress( &hal_send_nmi_name ) );
-		if ( !hal_send_nmi && m_entry.m_pdb.m_hal_send_nmi && memory::is_canonical_kernel_address( m_entry.m_pdb.m_hal_send_nmi ) )
-			hal_send_nmi = reinterpret_cast< hal_send_nmi_t >( m_entry.m_pdb.m_hal_send_nmi );
 
 		auto processor_count = KeQueryActiveProcessorCountEx( ALL_PROCESSOR_GROUPS );
 		if ( processor_count > m_max_processor_samples )

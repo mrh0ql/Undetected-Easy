@@ -268,9 +268,9 @@ namespace pool_integrity {
 				has_code_signature( modules, bytes, static_cast< unsigned long >( copied ), address, size ) )
 				command->m_signature_candidates++;
 
-			if ( copied >= sizeof( KDPC ) && dpc_integrity::is_plausible_dpc( reinterpret_cast< KDPC* >( address ) ) ) {
+			if ( copied >= sizeof( KDPC ) && dpc_integrity::is_plausible_dpc( reinterpret_cast< KDPC* >( bytes ) ) ) {
 				command->m_signature_candidates++;
-				detections += dpc_integrity::inspect_candidate( command, modules, reinterpret_cast< KDPC* >( address ), "bigpool" );
+				detections += dpc_integrity::inspect_candidate( command, modules, reinterpret_cast< KDPC* >( bytes ), "bigpool" );
 			}
 		}
 

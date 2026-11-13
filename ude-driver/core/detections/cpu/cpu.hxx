@@ -104,13 +104,21 @@ namespace cpu_integrity {
 	unsigned long scan_idt( ioctl::command_t* command, const system_modules_t* modules ) {
 		idtr_t idtr{ };
 		__sidt( &idtr );
-		if ( !idtr.m_base || idtr.m_limit < sizeof( idt_entry_t ) )
+		if ( !idtr.m_base || !memory::is_canonical_kernel_address( idtr.m_base ) || idtr.m_limit < sizeof( idt_entry_t ) )
 			return 0;
 
-		auto entries = reinterpret_cast< const idt_entry_t* >( idtr.m_base );
 		auto count = ( idtr.m_limit + 1 ) / sizeof( idt_entry_t );
 		if ( count > 256 )
 			count = 256;
+
+		idt_entry_t entries[ 256 ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory(
+			reinterpret_cast< void* >( idtr.m_base ),
+			count * sizeof( idt_entry_t ),
+			entries,
+			&copied ) )
+			return 0;
 
 		unsigned long detections = 0;
 		for ( auto index = 0ul; index < count; index++ ) {
