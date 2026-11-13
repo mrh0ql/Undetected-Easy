@@ -1229,9 +1229,21 @@ namespace report {
 		memset( disk_snapshot, 0, compare_size );
 
 		auto live_address = static_cast< unsigned char* >( module->m_image_base ) + section->VirtualAddress;
-		size_t bytes_copied = 0;
-		auto copied_section = memory::copy_kernel_memory( live_address, compare_size, live_snapshot, &bytes_copied );
-		if ( !copied_section ) {
+		size_t any_copied = 0;
+		for ( auto offset = 0ul; offset < compare_size; ) {
+			auto page_rem = PAGE_SIZE - ( ( reinterpret_cast< unsigned long long >( live_address + offset ) ) & ( PAGE_SIZE - 1 ) );
+			auto chunk = compare_size - offset;
+			if ( chunk > page_rem )
+				chunk = static_cast< unsigned long >( page_rem );
+
+			size_t page_copied = 0;
+			if ( memory::copy_kernel_memory( live_address + offset, chunk, static_cast< unsigned char* >( live_snapshot ) + offset, &page_copied ) )
+				any_copied += page_copied;
+
+			offset += chunk;
+		}
+
+		if ( !any_copied ) {
 			command->m_error = STATUS_PARTIAL_COPY;
 			memory::free_pool( disk_snapshot );
 			memory::free_pool( live_snapshot );

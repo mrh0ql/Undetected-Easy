@@ -79,17 +79,28 @@ namespace callback {
 	}
 
 	inline bool equal_image_name( const UNICODE_STRING* full_name, const char* candidate ) {
-		if ( !full_name || !full_name->Buffer || !candidate || !candidate[ 0 ] )
+		if ( !full_name || !full_name->Buffer || !full_name->Length || !candidate || !candidate[ 0 ] )
+			return false;
+
+		wchar_t name[ 260 ]{ };
+		auto copy_bytes = static_cast< size_t >( full_name->Length );
+		if ( copy_bytes > sizeof( name ) - sizeof( wchar_t ) )
+			copy_bytes = sizeof( name ) - sizeof( wchar_t );
+		copy_bytes &= ~( sizeof( wchar_t ) - 1 );
+		if ( !copy_bytes )
+			return false;
+
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( full_name->Buffer, copy_bytes, name, &copied ) )
 			return false;
 
 		auto candidate_length = 0ul;
 		while ( candidate[ candidate_length ] )
 			candidate_length++;
-		const auto character_count = full_name->Length / sizeof( wchar_t );
+		const auto character_count = static_cast< unsigned long >( copy_bytes / sizeof( wchar_t ) );
 		if ( !character_count || candidate_length > character_count )
 			return false;
 
-		auto name = full_name->Buffer;
 		auto name_start = character_count;
 		while ( name_start && name[ name_start - 1 ] != L'\\' && name[ name_start - 1 ] != L'/' )
 			name_start--;

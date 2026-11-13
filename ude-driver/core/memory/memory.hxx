@@ -70,18 +70,48 @@ namespace memory {
 		return false;
 	}
 
+	bool is_range_resident( const void* address, size_t size ) {
+		if ( !address || !size )
+			return false;
+
+		auto start = reinterpret_cast< unsigned long long >( address );
+		if ( !is_canonical_kernel_address( start ) )
+			return false;
+
+		auto end = start + size;
+		if ( end < start )
+			return false;
+
+		auto first_page = start & ~( static_cast< unsigned long long >( PAGE_SIZE ) - 1 );
+		auto last_page = ( end - 1 ) & ~( static_cast< unsigned long long >( PAGE_SIZE ) - 1 );
+		for ( auto page = first_page; page <= last_page; page += PAGE_SIZE ) {
+			if ( !MmIsAddressValid( reinterpret_cast< void* >( page ) ) )
+				return false;
+		}
+
+		return true;
+	}
+
 	const IMAGE_NT_HEADERS64* validate_pe_image( const unsigned char* image_base, size_t image_size ) {
 		if ( !image_base || image_size < PAGE_SIZE )
+			return nullptr;
+
+		if ( !is_range_resident( image_base, sizeof( IMAGE_DOS_HEADER ) ) )
 			return nullptr;
 
 		auto dos_header = reinterpret_cast< const IMAGE_DOS_HEADER* >( image_base );
 		if ( dos_header->e_magic != IMAGE_DOS_SIGNATURE )
 			return nullptr;
 
-		if ( dos_header->e_lfanew <= 0 || static_cast< size_t >( dos_header->e_lfanew ) > image_size - sizeof( IMAGE_NT_HEADERS64 ) )
+		if ( dos_header->e_lfanew <= 0 ||
+			static_cast< size_t >( dos_header->e_lfanew ) > 0x100000ul ||
+			static_cast< size_t >( dos_header->e_lfanew ) > image_size - sizeof( IMAGE_NT_HEADERS64 ) )
 			return nullptr;
 
 		auto nt_headers = reinterpret_cast< const IMAGE_NT_HEADERS64* >( image_base + dos_header->e_lfanew );
+		if ( !is_range_resident( nt_headers, sizeof( IMAGE_NT_HEADERS64 ) ) )
+			return nullptr;
+
 		if ( nt_headers->Signature != IMAGE_NT_SIGNATURE )
 			return nullptr;
 
@@ -91,13 +121,16 @@ namespace memory {
 		if ( nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC )
 			return nullptr;
 
+		if ( nt_headers->FileHeader.NumberOfSections > 96u )
+			return nullptr;
+
 		auto section_table_end =
 			static_cast< size_t >( dos_header->e_lfanew ) +
 			FIELD_OFFSET( IMAGE_NT_HEADERS64, OptionalHeader ) +
 			nt_headers->FileHeader.SizeOfOptionalHeader +
 			sizeof( IMAGE_SECTION_HEADER ) * nt_headers->FileHeader.NumberOfSections;
 
-		if ( section_table_end > image_size )
+		if ( section_table_end > image_size || !is_range_resident( image_base, section_table_end ) )
 			return nullptr;
 
 		return nt_headers;

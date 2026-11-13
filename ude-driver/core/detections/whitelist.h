@@ -56,10 +56,14 @@ namespace detections {
 			if ( target_end <= target_base || target < target_base || target >= target_end )
 				continue;
 
-			auto image = static_cast< const unsigned char* >( target_module->m_image_base );
-			auto headers = memory::validate_pe_image( image, target_module->m_image_size );
+			unsigned char header_page[ PAGE_SIZE ]{ };
+			size_t copied = 0;
+			if ( !memory::copy_kernel_memory( target_module->m_image_base, sizeof( header_page ), header_page, &copied ) )
+				return false;
+
+			auto headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
 			if ( !headers )
-				return true;
+				return false;
 
 			auto rva = static_cast< unsigned long >( target - target_base );
 			auto sections = IMAGE_FIRST_SECTION( const_cast< IMAGE_NT_HEADERS64* >( headers ) );

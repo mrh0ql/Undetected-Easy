@@ -79,14 +79,16 @@ namespace module::protection {
 		ioctl::command_t* command,
 		const system_module_t* module,
 		const char* module_name ) {
-		if ( !command || !module || !module_name || !module->m_image_base || !module->m_image_size )
+		if ( !command || !module || !module_name || !module->m_image_base || module->m_image_size < PAGE_SIZE )
+			return 0;
+
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t header_copied = 0;
+		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
 			return 0;
 
 		auto image_base = reinterpret_cast< unsigned long long >( module->m_image_base );
-		auto nt = memory::validate_pe_image(
-			static_cast< const unsigned char* >( module->m_image_base ),
-			module->m_image_size
-		);
+		auto nt = memory::validate_pe_image( header_page, sizeof( header_page ) );
 		if ( !nt )
 			return 0;
 
@@ -305,15 +307,16 @@ pfn_scan_result_t scan_page_pfn(
 	}
 
 	unsigned long scan_section_permissions( ioctl::command_t* command, const system_module_t* module, const char* module_name ) {
-		if ( !command || !module || !module_name || !module->m_image_base )
+		if ( !command || !module || !module_name || !module->m_image_base || module->m_image_size < PAGE_SIZE )
 			return 0;
 
-		auto dos_header = static_cast< const IMAGE_DOS_HEADER* >( module->m_image_base );
-		if ( dos_header->e_magic != IMAGE_DOS_SIGNATURE )
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t header_copied = 0;
+		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
 			return 0;
 
-		auto nt_headers = reinterpret_cast< const IMAGE_NT_HEADERS64* >( reinterpret_cast< const unsigned char* >( module->m_image_base ) + dos_header->e_lfanew );
-		if ( nt_headers->Signature != IMAGE_NT_SIGNATURE || nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC )
+		auto nt_headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		if ( !nt_headers )
 			return 0;
 
 		auto sections = IMAGE_FIRST_SECTION( const_cast< IMAGE_NT_HEADERS64* >( nt_headers ) );

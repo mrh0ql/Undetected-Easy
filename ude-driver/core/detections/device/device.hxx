@@ -772,17 +772,21 @@ namespace device_surface {
 		if ( !entry.m_dll_base || entry.m_size_of_image < PAGE_SIZE )
 			return false;
 
-		auto image = static_cast< const unsigned char* >( entry.m_dll_base );
-		auto headers = memory::validate_pe_image( image, entry.m_size_of_image );
+		auto entry_point = reinterpret_cast< unsigned long long >( entry.m_entry_point );
+		auto base = reinterpret_cast< unsigned long long >( entry.m_dll_base );
+		if ( entry_point && ( entry_point < base || entry_point >= base + entry.m_size_of_image ) )
+			return false;
+
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( entry.m_dll_base, sizeof( header_page ), header_page, &copied ) )
+			return true;
+
+		auto headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
 		if ( !headers )
 			return false;
 
 		if ( headers->OptionalHeader.SizeOfImage != entry.m_size_of_image )
-			return false;
-
-		auto entry_point = reinterpret_cast< unsigned long long >( entry.m_entry_point );
-		auto base = reinterpret_cast< unsigned long long >( entry.m_dll_base );
-		if ( entry_point && ( entry_point < base || entry_point >= base + entry.m_size_of_image ) )
 			return false;
 
 		return true;

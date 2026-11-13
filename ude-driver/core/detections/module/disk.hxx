@@ -31,36 +31,7 @@ namespace module::disk {
 	};
 
 	const IMAGE_NT_HEADERS64* validate_pe_image( const unsigned char* image_base, size_t image_size ) {
-		if ( !image_base || image_size < PAGE_SIZE )
-			return nullptr;
-
-		auto dos_header = reinterpret_cast< const IMAGE_DOS_HEADER* >( image_base );
-		if ( dos_header->e_magic != IMAGE_DOS_SIGNATURE )
-			return nullptr;
-
-		if ( dos_header->e_lfanew <= 0 || static_cast< size_t >( dos_header->e_lfanew ) > image_size - sizeof( IMAGE_NT_HEADERS64 ) )
-			return nullptr;
-
-		auto nt_headers = reinterpret_cast< const IMAGE_NT_HEADERS64* >( image_base + dos_header->e_lfanew );
-		if ( nt_headers->Signature != IMAGE_NT_SIGNATURE )
-			return nullptr;
-
-		if ( nt_headers->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 )
-			return nullptr;
-
-		if ( nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC )
-			return nullptr;
-
-		auto section_table_end =
-			static_cast< size_t >( dos_header->e_lfanew ) +
-			FIELD_OFFSET( IMAGE_NT_HEADERS64, OptionalHeader ) +
-			nt_headers->FileHeader.SizeOfOptionalHeader +
-			sizeof( IMAGE_SECTION_HEADER ) * nt_headers->FileHeader.NumberOfSections;
-
-		if ( section_table_end > image_size )
-			return nullptr;
-
-		return nt_headers;
+		return memory::validate_pe_image( image_base, image_size );
 	}
 
 	const IMAGE_SECTION_HEADER* find_section_by_name( const unsigned char* image_base, size_t image_size, const char* section_name ) {
@@ -103,7 +74,7 @@ namespace module::disk {
 			return nullptr;
 
 		if ( rva < nt_headers->OptionalHeader.SizeOfHeaders ) {
-			if ( bytes > image_size || rva > image_size - bytes )
+			if ( bytes > image_size || rva > image_size - bytes || !memory::is_range_resident( image_base + rva, bytes ) )
 				return nullptr;
 
 			return image_base + rva;
@@ -118,7 +89,7 @@ namespace module::disk {
 			return nullptr;
 
 		auto raw_offset = section->PointerToRawData + section_offset;
-		if ( raw_offset >= image_size || bytes > image_size - raw_offset )
+		if ( raw_offset >= image_size || bytes > image_size - raw_offset || !memory::is_range_resident( image_base + raw_offset, bytes ) )
 			return nullptr;
 
 		return image_base + raw_offset;
@@ -175,20 +146,32 @@ namespace module::disk {
 		if ( section_name && section_name_size )
 			section_name[ 0 ] = 0;
 
-		if ( !module || !module->m_image_base || !address )
+		if ( !module || !module->m_image_base || !address || module->m_image_size < PAGE_SIZE )
 			return false;
 
 		auto base = reinterpret_cast< unsigned long long >( module->m_image_base );
 		if ( address < base || address >= base + module->m_image_size )
 			return false;
 
-		auto image_base = static_cast< const unsigned char* >( module->m_image_base );
-		auto nt_headers = validate_pe_image( image_base, module->m_image_size );
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &copied ) ) {
+			paging::pt_entries_t entries{ };
+			if ( !paging::hyperspace_entries( entries, address ) )
+				return false;
+			if ( section_name && section_name_size )
+				RtlStringCbCopyA( section_name, section_name_size, ".code" );
+			return entries.m_pdpte.hard.page_size ? !entries.m_pdpte.hard.no_execute :
+				entries.m_pde.hard.page_size ? !entries.m_pde.hard.no_execute :
+				!entries.m_pte.hard.no_execute;
+		}
+
+		auto nt_headers = validate_pe_image( header_page, sizeof( header_page ) );
 		if ( !nt_headers )
 			return false;
 
 		auto rva = static_cast< unsigned long >( address - base );
-		auto section = find_section_by_rva( image_base, module->m_image_size, rva );
+		auto section = find_section_by_rva( header_page, sizeof( header_page ), rva );
 		if ( !section )
 			return false;
 

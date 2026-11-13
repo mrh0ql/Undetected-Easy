@@ -18,12 +18,12 @@ namespace memory {
         };
 
         unsigned long random_tag( ) {
-            unsigned int low = *reinterpret_cast< unsigned int* >( 0xFFFFF78000000000 );
-            unsigned int mul = *reinterpret_cast< unsigned int* >( 0xFFFFF78000000004 );
-            auto seed = ( ( std::uint64_t )( low ) * ( std::uint64_t )( mul ) ) >> 24;
+            LARGE_INTEGER tick{ };
+            KeQueryTickCount( &tick );
+            unsigned long seed = tick.LowPart ^ tick.HighPart;
 
-            auto r1 = RtlRandomEx( ( unsigned long* )&seed );
-            auto r2 = RtlRandomEx( ( unsigned long* )&seed );
+            auto r1 = RtlRandomEx( &seed );
+            auto r2 = RtlRandomEx( &seed );
             return ( r1 & 0xFFFF0000 ) | ( r2 & 0x0000FFFF );
         }
 
@@ -38,12 +38,17 @@ namespace memory {
 
         template <typename result_t>
         result_t allocate( size_t size, int type ) {
+            UNREFERENCED_PARAMETER( type );
             setup( );
 
-            auto pool = reinterpret_cast< uintptr_t >(
-                ExAllocatePoolWithTag( static_cast< POOL_TYPE >( type ), size + sizeof( pool_entry_t ), m_pool_tag ) );
-            if ( !pool )
+            constexpr POOL_TYPE nx_non_paged = static_cast< POOL_TYPE >( 512 );
+            auto raw_pool = ExAllocatePoolWithTag( nx_non_paged, size + sizeof( pool_entry_t ), m_pool_tag );
+            if ( !raw_pool )
+                raw_pool = ExAllocatePoolWithTag( NonPagedPool, size + sizeof( pool_entry_t ), m_pool_tag );
+            if ( !raw_pool )
                 return nullptr;
+
+            auto pool = reinterpret_cast< uintptr_t >( raw_pool );
 
             auto entry = reinterpret_cast< pool_entry_t* >( pool );
             entry->m_tag = m_pool_tag;

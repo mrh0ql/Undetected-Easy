@@ -45,13 +45,28 @@ namespace device_surface {
 		if ( !unicode.Buffer || !unicode.Length )
 			return false;
 
-		ANSI_STRING ansi{ };
-		if ( RtlUnicodeStringToAnsiString( &ansi, const_cast< UNICODE_STRING* >( &unicode ), TRUE ) )
+		wchar_t wide_copy[ 260 ]{ };
+		auto copy_bytes = static_cast< size_t >( unicode.Length );
+		if ( copy_bytes > sizeof( wide_copy ) - sizeof( wchar_t ) )
+			copy_bytes = sizeof( wide_copy ) - sizeof( wchar_t );
+		copy_bytes &= ~( sizeof( wchar_t ) - 1 );
+		if ( !copy_bytes )
 			return false;
 
-		auto ok = !RtlStringCbCopyA( buffer, buffer_size, ansi.Buffer );
-		RtlFreeAnsiString( &ansi );
-		return ok;
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( unicode.Buffer, copy_bytes, wide_copy, &copied ) )
+			return false;
+
+		auto char_count = copy_bytes / sizeof( wchar_t );
+		size_t out = 0;
+		for ( size_t i = 0; i < char_count && out + 1 < buffer_size; i++ ) {
+			auto wc = wide_copy[ i ];
+			if ( !wc )
+				break;
+			buffer[ out++ ] = ( wc <= 0x7f ) ? static_cast< char >( wc ) : '?';
+		}
+		buffer[ out ] = 0;
+		return out > 0;
 	}
 
 	bool open_driver_directory( HANDLE* handle ) {
@@ -194,8 +209,12 @@ namespace device_surface {
 		if ( !module || !module->m_image_base || module->m_image_size < PAGE_SIZE )
 			return false;
 
-		auto image_base = static_cast< const unsigned char* >( module->m_image_base );
-		auto nt_headers = memory::validate_pe_image( image_base, module->m_image_size );
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &copied ) )
+			return true;
+
+		auto nt_headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
 		if ( !nt_headers )
 			return false;
 
@@ -321,11 +340,15 @@ namespace device_surface {
 
 	unsigned long long find_ps_loaded_module_list_pattern( const system_modules_t* modules ) {
 		auto nt = module::disk::find_module_by_file_name( modules, "ntoskrnl.exe" );
-		if ( !nt || !nt->m_image_base || !nt->m_image_size )
+		if ( !nt || !nt->m_image_base || nt->m_image_size < PAGE_SIZE )
 			return 0;
 
-		auto image = static_cast< const unsigned char* >( nt->m_image_base );
-		auto headers = memory::validate_pe_image( image, nt->m_image_size );
+		unsigned char header_page[ PAGE_SIZE ]{ };
+		size_t header_copied = 0;
+		if ( !memory::copy_kernel_memory( nt->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
+			return 0;
+
+		auto headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
 		if ( !headers )
 			return 0;
 
