@@ -229,7 +229,26 @@ int wmain( int argc, wchar_t** argv ) {
             blocklist::g_policy.version.c_str( )
         );
     }
-	const std::wstring driver_path = argc >= 2 ? argv[ 1 ] : L"";
+	std::wstring driver_path;
+	if ( argc >= 2 && argv[ 1 ] && argv[ 1 ][ 0 ] ) {
+		wchar_t full_path[ MAX_PATH ]{};
+		if ( GetFullPathNameW( argv[ 1 ], MAX_PATH, full_path, nullptr ) )
+			driver_path = full_path;
+		else
+			driver_path = argv[ 1 ];
+	}
+	else {
+		wchar_t exe_file[ MAX_PATH ]{};
+		if ( GetModuleFileNameW( nullptr, exe_file, MAX_PATH ) ) {
+			std::wstring candidate( exe_file );
+			const auto sep = candidate.find_last_of( L"\\/" );
+			if ( sep != std::wstring::npos )
+				candidate.resize( sep + 1 );
+			candidate += L"ude-driver.sys";
+			if ( GetFileAttributesW( candidate.c_str( ) ) != INVALID_FILE_ATTRIBUTES )
+				driver_path = std::move( candidate );
+		}
+	}
 	render::widgets::stages::set_dashboard_driver_path( driver_path );
 
 	if ( !g_overlay->start( render::draw_callback ) ) {

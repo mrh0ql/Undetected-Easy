@@ -111,10 +111,10 @@ namespace service {
             return {};
         }
 
-        static wchar_t registry_path[ 80 ]{};
+        static wchar_t registry_path[ MAX_PATH ]{};
         std::memset( registry_path, 0, sizeof( registry_path ) );
-        std::wcscat( registry_path, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" );
-        std::wcscat( registry_path, service_name );
+        wcscpy_s( registry_path, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" );
+        wcscat_s( registry_path, service_name );
 
         UNICODE_STRING driver_path{};
         driver_path.Length = USHORT( std::wcslen( registry_path ) << 1 );
@@ -126,22 +126,8 @@ namespace service {
 
     bool uninstall_service( const wchar_t* service_name ) {
         if ( !service_name || service_name[ 0 ] == L'\0' ) {
-            utility::print( obf( "[ - ]" ), obf( "invalid service name" ) );
             return false;
         }
-
-        wchar_t registry_path[ MAX_PATH ]{};
-        const wchar_t* prefix = obf( L"\\??\\" );
-        std::wcscat( registry_path, prefix );
-
-        auto file_path = &registry_path[ 4 ];
-        if ( GetTempPathW( MAX_PATH - 4, file_path ) == 0 ) {
-            utility::print( obf( "[ - ]" ), obf( "failed to get temp path" ) );
-            return false;
-        }
-
-        std::wcscat( file_path, service_name );
-        std::wcscat( file_path, obf( L".log" ) );
 
         using nt_unload_driver_t = NTSTATUS( __stdcall* )( PUNICODE_STRING );
         auto* nt_unload_drv = reinterpret_cast< nt_unload_driver_t >(
@@ -163,11 +149,8 @@ namespace service {
         }
 
         const auto status = nt_unload_drv( &driver_nt_name );
-        if ( status == 0xc0000034 ) {
-
-        }
-        else if ( status != 0 ) {
-            return false;
+        if ( status != 0 && status != 0xc0000034 && status != 0xc000000e ) {
+            // Continue cleaning registry key even if driver was not currently active in memory
         }
 
         HKEY services_key = nullptr;
@@ -182,28 +165,7 @@ namespace service {
             return false;
         }
 
-        HKEY service_key = nullptr;
-        wchar_t image_path[ MAX_PATH ] = { 0 };
-        bool have_image_path = false;
-
-        result = RegOpenKeyW( services_key, service_name, &service_key );
-        if ( result == ERROR_SUCCESS ) {
-            DWORD data_type = REG_NONE;
-            DWORD data_size = sizeof( image_path );
-            result = RegQueryValueExW( service_key, L"ImagePath", nullptr, &data_type, reinterpret_cast< LPBYTE >( image_path ), &data_size );
-            if ( result == ERROR_SUCCESS && ( data_type == REG_SZ || data_type == REG_EXPAND_SZ ) ) {
-                have_image_path = true;
-                if ( data_type == REG_EXPAND_SZ ) {
-                    wchar_t expanded_path[ MAX_PATH ];
-                    if ( ExpandEnvironmentStringsW( image_path, expanded_path, MAX_PATH ) != 0 ) {
-                        wcscpy_s( image_path, expanded_path );
-                    }
-                }
-            }
-            RegCloseKey( service_key );
-        }
-
-        result = RegDeleteKeyW( services_key, service_name );
+        result = RegDeleteTreeW( services_key, service_name );
         RegCloseKey( services_key );
 
         return result == ERROR_SUCCESS;
@@ -269,15 +231,19 @@ namespace service {
         }
 
         auto status = nt_load_drv( &driver_nt_name );
-        if ( status == 0xc0000035 ) {
-            utility::print( obf( "[ - ]" ), obf( "found existing service.\n" ) );
-            uninstall_services( );
-            utility::print( obf( "[ - ]" ), obf( "please restart and try again." ) );
-            return false;
+        if ( status == 0xc000010e || status == 0xc0000035 ) {
+            using nt_unload_driver_t = NTSTATUS( __stdcall* )( PUNICODE_STRING );
+            auto* nt_unload_drv = reinterpret_cast< nt_unload_driver_t >(
+                GetProcAddress( GetModuleHandleA( obf( "ntdll.dll" ) ), obf( "NtUnloadDriver" ) )
+            );
+            if ( nt_unload_drv ) {
+                nt_unload_drv( &driver_nt_name );
+                status = nt_load_drv( &driver_nt_name );
+            }
         }
 
         if ( status != 0 ) {
-            utility::print( obf( "[ - ]" ), obf( "NtLoadDriver failed: %x" ), status );
+            utility::print( obf( "[ - ]" ), obf( "NtLoadDriver failed: 0x%08x" ), static_cast< unsigned int >( status ) );
             return false;
         }
 

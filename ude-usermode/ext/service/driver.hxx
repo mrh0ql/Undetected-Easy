@@ -126,17 +126,24 @@ namespace service {
 			std::memset( m_driver_path, 0, sizeof( m_driver_path ) );
 			std::memset( m_driver_name, 0, sizeof( m_driver_name ) );
 
+			wchar_t resolved_path[ MAX_PATH ]{};
 			const wchar_t* prefix = obf( L"\\??\\" );
-			if ( std::wcsncmp( driver_path, prefix, std::wcslen( prefix ) ) != 0 )
-				std::wcscat( m_driver_path, prefix );
-			std::wcscat( m_driver_path, driver_path );
+			const wchar_t* raw_path = driver_path;
+			if ( std::wcsncmp( raw_path, prefix, std::wcslen( prefix ) ) == 0 )
+				raw_path += std::wcslen( prefix );
 
-			const wchar_t* file_name = std::wcsrchr( driver_path, L'\\' );
+			if ( GetFullPathNameW( raw_path, MAX_PATH, resolved_path, nullptr ) == 0 )
+				wcscpy_s( resolved_path, raw_path );
+
+			wcscpy_s( m_driver_path, prefix );
+			wcscat_s( m_driver_path, resolved_path );
+
+			const wchar_t* file_name = std::wcsrchr( resolved_path, L'\\' );
 			if ( !file_name )
-				file_name = std::wcsrchr( driver_path, L'/' );
-			file_name = file_name ? file_name + 1 : driver_path;
+				file_name = std::wcsrchr( resolved_path, L'/' );
+			file_name = file_name ? file_name + 1 : resolved_path;
 
-			std::wcscat( m_driver_name, file_name );
+			wcscpy_s( m_driver_name, file_name );
 			wchar_t* extension = std::wcsrchr( m_driver_name, L'.' );
 			if ( extension )
 				*extension = L'\0';
@@ -164,8 +171,10 @@ namespace service {
 		}
 
 		bool unload( ) {
-			uninstall_service( m_driver_name );
-			load_driver_privilage( false );
+			if ( m_driver_name[ 0 ] != L'\0' ) {
+				uninstall_service( m_driver_name );
+				load_driver_privilage( false );
+			}
 			return true;
 		}
 

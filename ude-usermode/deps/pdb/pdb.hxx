@@ -68,6 +68,13 @@ namespace pdb {
         }
 
         bool load( ) {
+            HRESULT com_hr = CoInitializeEx( nullptr, COINIT_MULTITHREADED );
+            const bool should_uninit_com = SUCCEEDED( com_hr );
+            struct com_guard_t {
+                bool active;
+                ~com_guard_t( ) { if ( active ) CoUninitialize( ); }
+            } com_guard{ should_uninit_com };
+
             this->m_module_base = get_kernel_module( m_module_bare.c_str( ) );
             if ( !m_module_base ) {
                 std::string lower = m_module_bare;
@@ -91,7 +98,15 @@ namespace pdb {
                 IID_IDiaDataSource, ( void** )&pSource );
 
             if ( FAILED( hr ) ) {
-                const wchar_t* dia_versions[ ] = { L"msdia140.dll", L"msdia120.dll", L"msdia110.dll" };
+                wchar_t exe_path[ MAX_PATH ]{};
+                std::wstring local_msdia = L"msdia140.dll";
+                if ( GetModuleFileNameW( nullptr, exe_path, MAX_PATH ) ) {
+                    std::wstring dir( exe_path );
+                    auto sep = dir.find_last_of( L"\\/" );
+                    if ( sep != std::wstring::npos )
+                        local_msdia = dir.substr( 0, sep + 1 ) + L"msdia140.dll";
+                }
+                const wchar_t* dia_versions[ ] = { local_msdia.c_str( ), L"msdia140.dll", L"msdia120.dll", L"msdia110.dll" };
                 for ( const auto& dll : dia_versions ) {
                     hr = NoRegCoCreate( dll, CLSID_DiaSource, IID_IDiaDataSource, ( void** )&pSource );
                     if ( SUCCEEDED( hr ) ) break;
@@ -292,7 +307,23 @@ namespace pdb {
             return get_symbol_address( symbol_name );
         }
 
+        static void enable_debug_privilege( ) {
+            HANDLE token = nullptr;
+            if ( !OpenProcessToken( GetCurrentProcess( ), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token ) )
+                return;
+
+            TOKEN_PRIVILEGES tp{};
+            tp.PrivilegeCount = 1;
+            if ( LookupPrivilegeValueA( nullptr, obf( "SeDebugPrivilege" ), &tp.Privileges[ 0 ].Luid ) ) {
+                tp.Privileges[ 0 ].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges( token, FALSE, &tp, sizeof( tp ), nullptr, nullptr );
+            }
+            CloseHandle( token );
+        }
+
         static std::uint64_t get_kernel_module( const char* module_name ) {
+            enable_debug_privilege( );
+
             void* buffer = nullptr;
             unsigned long buffer_size = 0;
             NTSTATUS status = NtQuerySystemInformation(
@@ -315,25 +346,44 @@ namespace pdb {
                 );
             }
 
-            if ( !NT_SUCCESS( status ) || !buffer ) {
-                if ( buffer ) VirtualFree( buffer, 0, MEM_RELEASE );
-                return 0;
+            if ( NT_SUCCESS( status ) && buffer ) {
+                std::uint64_t matched_base = 0;
+                const auto modules = reinterpret_cast< rtl_process_modules_t* >( buffer );
+                for ( auto idx = 0u; idx < modules->m_count; ++idx ) {
+                    const auto current_module_name = std::string(
+                        reinterpret_cast< char* >( modules->m_modules[ idx ].m_full_path ) +
+                        modules->m_modules[ idx ].m_offset_to_file_name
+                    );
+                    const bool is_ntos_entry = ( idx == 0 && !_stricmp( module_name, "ntoskrnl.exe" ) );
+                    if ( !_stricmp( current_module_name.c_str( ), module_name ) || is_ntos_entry ) {
+                        matched_base = reinterpret_cast< std::uint64_t >( modules->m_modules[ idx ].m_image_base );
+                        break;
+                    }
+                }
+                VirtualFree( buffer, 0, MEM_RELEASE );
+                if ( matched_base )
+                    return matched_base;
+            }
+            else if ( buffer ) {
+                VirtualFree( buffer, 0, MEM_RELEASE );
             }
 
-            const auto modules = reinterpret_cast< rtl_process_modules_t* >( buffer );
-            for ( auto idx = 0u; idx < modules->m_count; ++idx ) {
-                const auto current_module_name = std::string(
-                    reinterpret_cast< char* >( modules->m_modules[ idx ].m_full_path ) +
-                    modules->m_modules[ idx ].m_offset_to_file_name
-                );
-                if ( !_stricmp( current_module_name.c_str( ), module_name ) ) {
-                    const auto module_base = reinterpret_cast< std::uint64_t >( modules->m_modules[ idx ].m_image_base );
-                    VirtualFree( buffer, 0, MEM_RELEASE );
-                    return module_base;
+            DWORD cb_needed = 0;
+            if ( EnumDeviceDrivers( nullptr, 0, &cb_needed ) && cb_needed >= sizeof( LPVOID ) ) {
+                std::vector< LPVOID > drivers( cb_needed / sizeof( LPVOID ) );
+                if ( EnumDeviceDrivers( drivers.data( ), cb_needed, &cb_needed ) ) {
+                    const auto count = cb_needed / sizeof( LPVOID );
+                    for ( size_t i = 0; i < count; ++i ) {
+                        if ( !drivers[ i ] ) continue;
+                        char base_name[ MAX_PATH ]{};
+                        if ( GetDeviceDriverBaseNameA( drivers[ i ], base_name, sizeof( base_name ) ) ) {
+                            if ( !_stricmp( base_name, module_name ) || ( i == 0 && !_stricmp( module_name, "ntoskrnl.exe" ) ) )
+                                return reinterpret_cast< std::uint64_t >( drivers[ i ] );
+                        }
+                    }
                 }
             }
 
-            VirtualFree( buffer, 0, MEM_RELEASE );
             return 0;
         }
 
