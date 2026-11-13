@@ -19,7 +19,7 @@ namespace execution::processor {
 		USHORT m_count;
 		USHORT m_size;
 		ULONG m_reserved;
-		ULONG_PTR m_bitmap[ 20 ];
+		ULONG_PTR m_bitmap[ 64 ];
 	};
 
 	using ke_initialize_affinity_ex_t = void( NTAPI* )( kaffinity_ex_t* affinity );
@@ -101,17 +101,8 @@ namespace execution::processor {
 			}
 		}
 
-		auto frame_cursor = aligned_rsp;
-		auto frame_page_end = page_end;
-		if ( sample->m_interrupted_context &&
-			MmIsAddressValid( reinterpret_cast< void* >( sample->m_rsp ) ) &&
-			MmIsAddressValid( reinterpret_cast< void* >( ( ( sample->m_rsp & ~0xfffull ) + PAGE_SIZE ) - sizeof( unsigned long long ) ) ) ) {
-			frame_cursor = ( sample->m_rsp + 7ull ) & ~7ull;
-			frame_page_end = ( sample->m_rsp & ~0xfffull ) + PAGE_SIZE;
-		}
-
-		for ( auto cursor = frame_cursor;
-			cursor + sizeof( unsigned long long ) <= frame_page_end && sample->m_frame_count < m_max_sample_frames;
+		for ( auto cursor = aligned_rsp;
+			cursor + sizeof( unsigned long long ) <= page_end && sample->m_frame_count < m_max_sample_frames;
 			cursor += sizeof( unsigned long long ) ) {
 			auto value = *reinterpret_cast< const unsigned long long* >( cursor );
 			if ( !memory::is_canonical_kernel_address( value ) )
@@ -604,19 +595,35 @@ namespace execution::processor {
 		if ( !command || !modules )
 			return false;
 
-		sample_context_t samples{ };
-		collect_processor_samples( &samples );
+		constexpr auto repeated_capacity = 128ul;
+		auto samples = memory::allocate_pool< sample_context_t* >( sizeof( sample_context_t ), 1 );
+		auto repeated_regions = memory::allocate_pool< unsigned long long* >( sizeof( unsigned long long ) * repeated_capacity, 1 );
+		auto repeated_counts = memory::allocate_pool< unsigned long* >( sizeof( unsigned long ) * repeated_capacity, 1 );
+		if ( !samples || !repeated_regions || !repeated_counts ) {
+			if ( repeated_counts )
+				memory::free_pool( repeated_counts );
+			if ( repeated_regions )
+				memory::free_pool( repeated_regions );
+			if ( samples )
+				memory::free_pool( samples );
+			command->m_error = STATUS_INSUFFICIENT_RESOURCES;
+			return false;
+		}
 
-		unsigned long long repeated_regions[ 128 ]{ };
-		unsigned long repeated_counts[ 128 ]{ };
+		memset( samples, 0, sizeof( sample_context_t ) );
+		memset( repeated_regions, 0, sizeof( unsigned long long ) * repeated_capacity );
+		memset( repeated_counts, 0, sizeof( unsigned long ) * repeated_capacity );
+
+		collect_processor_samples( samples );
+
 		unsigned long sampled_processors = 0;
 		unsigned long sample_detections = 0;
-		auto nmi_samples = count_samples_by_source( samples, sample_source_t::nmi_callback );
-		auto ipi_samples = count_samples_by_source( samples, sample_source_t::ipi_callback );
-		auto interrupted_samples = count_interrupted_context_samples( samples );
+		auto nmi_samples = count_samples_by_source( *samples, sample_source_t::nmi_callback );
+		auto ipi_samples = count_samples_by_source( *samples, sample_source_t::ipi_callback );
+		auto interrupted_samples = count_interrupted_context_samples( *samples );
 
 		for ( auto index = 0ul; index < m_max_processor_samples; index++ ) {
-			auto sample = &samples.m_samples[ index ];
+			auto sample = &samples->m_samples[ index ];
 			if ( !sample->m_valid )
 				continue;
 
@@ -625,7 +632,7 @@ namespace execution::processor {
 			address_info_t info{ };
 			query_address_info( modules, sample->m_rip, &info );
 			if ( should_track_repeated_region( info ) )
-				record_region( repeated_regions, repeated_counts, ARRAYSIZE( repeated_regions ), sample->m_rip );
+				record_region( repeated_regions, repeated_counts, repeated_capacity, sample->m_rip );
 
 			auto before = command->m_total_detection_count;
 			add_address_classification_detection( command, sample_source_name( sample->m_source ), sample->m_processor, sample->m_rip, info, false );
@@ -643,7 +650,7 @@ namespace execution::processor {
 					continue;
 
 				if ( should_track_repeated_region( frame_info ) )
-					record_region( repeated_regions, repeated_counts, ARRAYSIZE( repeated_regions ), candidate );
+					record_region( repeated_regions, repeated_counts, repeated_capacity, candidate );
 
 				before = command->m_total_detection_count;
 				add_address_classification_detection( command, "nmi_stack_frame", sample->m_processor, candidate, frame_info, true );
@@ -657,12 +664,16 @@ namespace execution::processor {
 			modules,
 			repeated_regions,
 			repeated_counts,
-			ARRAYSIZE( repeated_regions )
+			repeated_capacity
 		);
 
 		auto pivot_detections = scan_stack_bounds( command );
 		auto thread_start_detections = execution::thread::scan( command, modules );
-		auto repeated_detections = report_repeated_regions( command, repeated_regions, repeated_counts, ARRAYSIZE( repeated_regions ) );
+		auto repeated_detections = report_repeated_regions( command, repeated_regions, repeated_counts, repeated_capacity );
+
+		memory::free_pool( repeated_counts );
+		memory::free_pool( repeated_regions );
+		memory::free_pool( samples );
 
 		utility::print(
 			"execution integrity: cpu_samples=%lu nmi_callback=%lu ipi_callback=%lu interrupted_context=%lu sample_detections=%lu stack_detections=%lu pivot_detections=%lu thread_start_detections=%lu repeated_detections=%lu detections=%lu\n",

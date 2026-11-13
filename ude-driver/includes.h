@@ -10,11 +10,10 @@
 #include <core/utility/utility.hxx>
 
 #include <core/memory/pool/pool.hxx>
-#include <core/memory/memory.hxx>
-#include <core/utility/config.hxx>
-
 #include <core/memory/paging/paging.hxx>
 #include <core/memory/paging/remap.hxx>
+#include <core/memory/memory.hxx>
+#include <core/utility/config.hxx>
 
 #include <core/ioctl/commands.h>
 

@@ -62,16 +62,16 @@ namespace module::protection {
 			!physical_address || !translated_size )
 			return false;
 
-		unsigned char bytes[ PAGE_SIZE ]{ };
+		memory::scoped_page_t bytes{ };
 		size_t copied = 0;
-		if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( page ), sizeof( bytes ), bytes, &copied ) )
+		if ( !bytes || !memory::copy_kernel_memory( reinterpret_cast< void* >( page ), PAGE_SIZE, bytes.get( ), &copied ) )
 			return false;
 
 		*pfn = physical_address >> PAGE_SHIFT;
 		*mapping_size = translated_size;
 		*leaf_value = entries.m_pdpte.hard.page_size ? entries.m_pdpte.value :
 			entries.m_pde.hard.page_size ? entries.m_pde.value : entries.m_pte.value;
-		*digest = c_sha1::hash_buffer( bytes, copied );
+		*digest = c_sha1::hash_buffer( bytes.get( ), copied );
 		return true;
 	}
 
@@ -82,13 +82,13 @@ namespace module::protection {
 		if ( !command || !module || !module_name || !module->m_image_base || module->m_image_size < PAGE_SIZE )
 			return 0;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
+		memory::scoped_page_t header_page{ };
 		size_t header_copied = 0;
-		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
+		if ( !header_page || !memory::copy_kernel_memory( module->m_image_base, PAGE_SIZE, header_page.get( ), &header_copied ) )
 			return 0;
 
 		auto image_base = reinterpret_cast< unsigned long long >( module->m_image_base );
-		auto nt = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		auto nt = memory::validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !nt )
 			return 0;
 
@@ -310,12 +310,14 @@ pfn_scan_result_t scan_page_pfn(
 		if ( !command || !module || !module_name || !module->m_image_base || module->m_image_size < PAGE_SIZE )
 			return 0;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
+		memory::scoped_page_t header_page{ };
+		memory::scoped_page_t page_bytes{ };
 		size_t header_copied = 0;
-		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
+		if ( !header_page || !page_bytes ||
+			!memory::copy_kernel_memory( module->m_image_base, PAGE_SIZE, header_page.get( ), &header_copied ) )
 			return 0;
 
-		auto nt_headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		auto nt_headers = memory::validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !nt_headers )
 			return 0;
 
@@ -396,11 +398,11 @@ pfn_scan_result_t scan_page_pfn(
 			}
 
 			if ( expected_executable ) {
-				unsigned char page_bytes[ PAGE_SIZE ]{ };
+				memset( page_bytes.get( ), 0, PAGE_SIZE );
 				size_t bytes_copied = 0;
-				memory::copy_kernel_memory( reinterpret_cast< void* >( page ), PAGE_SIZE, page_bytes, &bytes_copied );
+				memory::copy_kernel_memory( reinterpret_cast< void* >( page ), PAGE_SIZE, page_bytes.get( ), &bytes_copied );
 
-				auto pfn_result = scan_page_pfn( page, pt_entries, page_bytes, bytes_copied );
+				auto pfn_result = scan_page_pfn( page, pt_entries, page_bytes.get( ), static_cast< unsigned long >( bytes_copied ) );
 				if ( pfn_result.suspicious( ) && pt_entries.m_pte.value && pt_entries.m_pte.hard.pfn ) {
 				const char* reason = nullptr;
 

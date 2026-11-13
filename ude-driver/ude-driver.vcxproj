@@ -89,6 +89,9 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <ClCompile>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DriverSign>
@@ -96,11 +99,10 @@
     </DriverSign>
     <ClCompile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-    </ClCompile>
-    <ClCompile>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
     </ClCompile>
     <Link>
       <EntryPointSymbol>entry_point</EntryPointSymbol>

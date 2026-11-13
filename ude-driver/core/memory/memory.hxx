@@ -24,11 +24,73 @@ namespace memory {
 			free_pool( reinterpret_cast< void* >( base_address ) );
 	}
 
+	struct scoped_page_t {
+		unsigned char* m_bytes;
+
+		scoped_page_t( )
+			: m_bytes( allocate_pool< unsigned char* >( PAGE_SIZE, 1 ) ) {
+			if ( m_bytes )
+				memset( m_bytes, 0, PAGE_SIZE );
+		}
+
+		~scoped_page_t( ) {
+			if ( m_bytes )
+				free_pool( m_bytes );
+		}
+
+		scoped_page_t( const scoped_page_t& ) = delete;
+		scoped_page_t& operator=( const scoped_page_t& ) = delete;
+
+		explicit operator bool( ) const {
+			return m_bytes != nullptr;
+		}
+
+		unsigned char* get( ) const {
+			return m_bytes;
+		}
+	};
+
 	bool copy_kernel_memory( void* source, size_t size, void* destination, size_t* bytes_copied ) {
-		MM_COPY_ADDRESS address{ };
-		address.VirtualAddress = source;
-		auto status = MmCopyMemory( destination, address, size, MM_COPY_MEMORY_VIRTUAL, bytes_copied );
-		return !status && bytes_copied && *bytes_copied == size;
+		if ( bytes_copied )
+			*bytes_copied = 0;
+
+		if ( !source || !destination || !size )
+			return false;
+
+		auto current_va = reinterpret_cast< unsigned long long >( source );
+		if ( !is_canonical_kernel_address( current_va ) || current_va + size < current_va )
+			return false;
+
+		auto dst = static_cast< unsigned char* >( destination );
+		size_t total_copied = 0;
+
+		while ( total_copied < size ) {
+			if ( !is_canonical_kernel_address( current_va ) ||
+				!MmIsAddressValid( reinterpret_cast< void* >( current_va ) ) )
+				return false;
+
+			auto page_offset = static_cast< size_t >( current_va & ( PAGE_SIZE - 1 ) );
+			auto chunk = static_cast< size_t >( PAGE_SIZE ) - page_offset;
+			auto remaining = size - total_copied;
+			if ( chunk > remaining )
+				chunk = remaining;
+
+			std::uint64_t physical_address = 0;
+			std::uint32_t translated_page_size = 0;
+			if ( !paging::translate_linear( current_va, &physical_address, &translated_page_size ) || !physical_address )
+				return false;
+
+			if ( !paging::remap::read_physical_page_chunk( physical_address, dst + total_copied, chunk ) )
+				return false;
+
+			current_va += chunk;
+			total_copied += chunk;
+		}
+
+		if ( bytes_copied )
+			*bytes_copied = total_copied;
+
+		return true;
 	}
 
 	bool query_system_modules( system_modules_t** modules ) {
@@ -93,7 +155,7 @@ namespace memory {
 	}
 
 	const IMAGE_NT_HEADERS64* validate_pe_image( const unsigned char* image_base, size_t image_size ) {
-		if ( !image_base || image_size < PAGE_SIZE )
+		if ( !image_base || image_size < 0x400 )
 			return nullptr;
 
 		if ( !is_range_resident( image_base, sizeof( IMAGE_DOS_HEADER ) ) )

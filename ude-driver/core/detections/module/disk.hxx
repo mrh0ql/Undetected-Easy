@@ -153,9 +153,9 @@ namespace module::disk {
 		if ( address < base || address >= base + module->m_image_size )
 			return false;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
+		memory::scoped_page_t header_page{ };
 		size_t copied = 0;
-		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &copied ) ) {
+		if ( !header_page || !memory::copy_kernel_memory( module->m_image_base, PAGE_SIZE, header_page.get( ), &copied ) ) {
 			paging::pt_entries_t entries{ };
 			if ( !paging::hyperspace_entries( entries, address ) )
 				return false;
@@ -166,12 +166,12 @@ namespace module::disk {
 				!entries.m_pte.hard.no_execute;
 		}
 
-		auto nt_headers = validate_pe_image( header_page, sizeof( header_page ) );
+		auto nt_headers = validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !nt_headers )
 			return false;
 
 		auto rva = static_cast< unsigned long >( address - base );
-		auto section = find_section_by_rva( header_page, sizeof( header_page ), rva );
+		auto section = find_section_by_rva( header_page.get( ), PAGE_SIZE, rva );
 		if ( !section )
 			return false;
 

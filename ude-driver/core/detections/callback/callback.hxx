@@ -308,21 +308,48 @@ namespace callback {
 		PIMAGE_INFO image_info
 	) {
 		UNREFERENCED_PARAMETER( process_id );
-		UNREFERENCED_PARAMETER( image_info );
-		if ( !full_image_name )
+		if ( !full_image_name || !full_image_name->Buffer || !full_image_name->Length ||
+			!image_info || !image_info->SystemModeImage )
+			return;
+
+		wchar_t wide_name[ 260 ]{ };
+		auto copy_bytes = static_cast< size_t >( full_image_name->Length );
+		if ( copy_bytes > sizeof( wide_name ) - sizeof( wchar_t ) )
+			copy_bytes = sizeof( wide_name ) - sizeof( wchar_t );
+		copy_bytes &= ~( sizeof( wchar_t ) - 1 );
+		if ( !copy_bytes )
+			return;
+
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( full_image_name->Buffer, copy_bytes, wide_name, &copied ) )
+			return;
+
+		const auto character_count = static_cast< unsigned long >( copy_bytes / sizeof( wchar_t ) );
+		if ( !character_count )
+			return;
+
+		auto name_start = character_count;
+		while ( name_start && wide_name[ name_start - 1 ] != L'\\' && wide_name[ name_start - 1 ] != L'/' )
+			name_start--;
+
+		char base_name[ 128 ]{ };
+		unsigned long out = 0;
+		for ( auto i = name_start; i < character_count && out + 1 < sizeof( base_name ); i++ ) {
+			auto wc = wide_name[ i ];
+			if ( !wc )
+				break;
+			base_name[ out++ ] = ( wc <= 0x7f ) ? static_cast< char >( wc ) : '?';
+		}
+		base_name[ out ] = '\0';
+		if ( !out )
 			return;
 
 		KeEnterCriticalRegion( );
 		ExAcquirePushLockExclusive( &m_blocklist_lock );
 		for ( auto index = 0ul; index < m_vulnerable_driver_blocklist_count; index++ ) {
 			const auto& entry = m_vulnerable_driver_blocklist[ index ];
-			if ( ( entry.m_kind == blocklist_rule_kind::direct_deny ||
-				entry.m_kind == blocklist_rule_kind::denied_signer_file_attribute ) &&
-				entry.m_file_name[ 0 ] &&
-				!equal_ascii_insensitive( entry.m_file_name, "*" ) &&
-				equal_image_name( full_image_name, entry.m_file_name ) ) {
-				const auto name = entry.m_file_name;
-				record_blocked_driver_locked( name );
+			if ( blocklist_matches_name( entry, base_name ) ) {
+				record_blocked_driver_locked( entry.m_file_name[ 0 ] ? entry.m_file_name : base_name );
 				break;
 			}
 		}

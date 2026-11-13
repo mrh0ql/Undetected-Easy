@@ -230,24 +230,7 @@ namespace object_integrity {
 			return true;
 		}
 
-		PFILE_OBJECT file_object = nullptr;
-		PDEVICE_OBJECT resolved_device = nullptr;
-		status = IoGetDeviceObjectPointer(
-			&target,
-			FILE_READ_ATTRIBUTES,
-			&file_object,
-			&resolved_device
-		);
-		if ( status || !file_object || !resolved_device ) {
-			if ( file_object )
-				ObDereferenceObject( file_object );
-			return false;
-		}
-
-		ObReferenceObject( resolved_device );
-		ObDereferenceObject( file_object );
-		*device_object = resolved_device;
-		return true;
+		return false;
 	}
 
 	unsigned long scan_public_device_links( ioctl::command_t* command, const system_modules_t* modules, PDRIVER_OBJECT* scanned, unsigned long* scanned_count, unsigned long* links ) {
@@ -285,7 +268,11 @@ namespace object_integrity {
 			if ( links )
 				( *links )++;
 
-			auto driver_object = device_object->DriverObject;
+			DEVICE_OBJECT dev_copy{ };
+			size_t copied = 0;
+			PDRIVER_OBJECT driver_object = nullptr;
+			if ( memory::copy_kernel_memory( device_object, sizeof( dev_copy ), &dev_copy, &copied ) )
+				driver_object = dev_copy.DriverObject;
 			auto owner = device_surface::find_driver_owner_module( modules, driver_object );
 			auto dispatch_host = owner || !driver_object ? nullptr : device_surface::find_trusted_dispatch_host_module( modules, driver_object );
 			auto effective_owner = owner ? owner : dispatch_host;
@@ -567,10 +554,17 @@ namespace object_integrity {
 		if ( !command || !modules )
 			return false;
 
+		auto scanned_drivers = memory::allocate_pool< PDRIVER_OBJECT* >( 512 * sizeof( PDRIVER_OBJECT ), 1 );
+		if ( !scanned_drivers ) {
+			command->m_result = false;
+			command->m_error = STATUS_INSUFFICIENT_RESOURCES;
+			return false;
+		}
+		memset( scanned_drivers, 0, 512 * sizeof( PDRIVER_OBJECT ) );
+
 		unsigned long named_sections = 0;
 		unsigned long symbolic_links = 0;
 		unsigned long ob_types = 0;
-		PDRIVER_OBJECT scanned_drivers[ 512 ]{ };
 		unsigned long scanned_driver_count = 0;
 
 		auto detections = scan_named_sections(
@@ -582,6 +576,8 @@ namespace object_integrity {
 		detections += scan_physical_memory_section( command );
 		detections += scan_kuser_shared_data( command );
 		detections += scan_object_type_initializers( command, modules, &ob_types );
+
+		memory::free_pool( scanned_drivers );
 
 		command->m_modules_scanned = modules->m_count;
 		command->m_sections_scanned = named_sections + symbolic_links + ob_types + 2;

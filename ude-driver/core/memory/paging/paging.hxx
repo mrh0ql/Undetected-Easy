@@ -26,12 +26,19 @@ namespace paging {
 
     bool hyperspace_entries( pt_entries_t& entries, std::uint64_t addr ) {
         virt_addr_t va{ addr };
-        if ( !remap::read_physical( m_directory_table_base + ( va.pml4e_index * sizeof( pml4e ) ),
-            &entries.m_pml4e, sizeof( pml4e ) ) )
+        auto active_cr3 = __readcr3( ) & ~0xfffull;
+        auto system_cr3 = m_directory_table_base & ~0xfffull;
+        auto primary_cr3 = active_cr3 ? active_cr3 : system_cr3;
+        if ( !primary_cr3 )
             return false;
 
-        if ( !entries.m_pml4e.hard.present )
-            return false;
+        if ( !remap::read_physical( primary_cr3 + ( va.pml4e_index * sizeof( pml4e ) ),
+            &entries.m_pml4e, sizeof( pml4e ) ) || !entries.m_pml4e.hard.present ) {
+            if ( !system_cr3 || system_cr3 == primary_cr3 ||
+                !remap::read_physical( system_cr3 + ( va.pml4e_index * sizeof( pml4e ) ),
+                    &entries.m_pml4e, sizeof( pml4e ) ) || !entries.m_pml4e.hard.present )
+                return false;
+        }
 
         if ( !remap::read_physical( ( entries.m_pml4e.hard.pfn << page_shift ) + ( va.pdpte_index * sizeof( pdpte ) ),
             &entries.m_pdpte, sizeof( pdpte ) ) )
@@ -66,7 +73,7 @@ namespace paging {
     }
 
     bool translate_linear( std::uint64_t va, std::uint64_t* pa = nullptr, std::uint32_t* page_size = nullptr ) {
-        pt_entries_t pt_entries;
+        pt_entries_t pt_entries{};
         if ( !hyperspace_entries( pt_entries, va ) )
             return false;
 
@@ -79,7 +86,7 @@ namespace paging {
         if ( pt_entries.m_pdpte.hard.page_size ) {
             if ( page_size ) *page_size = page_1gb_size;
             if ( pa ) {
-                auto pfn_masked = pt_entries.m_pdpte.hard.pfn & 0x3FFFFF;
+                auto pfn_masked = pt_entries.m_pdpte.hard.pfn & ~( ( page_1gb_size / page_4kb_size ) - 1 );
                 *pa = ( pfn_masked << page_shift ) | ( va & page_1gb_mask );
             }
             return true;
@@ -91,7 +98,7 @@ namespace paging {
         if ( pt_entries.m_pde.hard.page_size ) {
             if ( page_size ) *page_size = page_2mb_size;
             if ( pa ) {
-                auto pfn_masked = pt_entries.m_pde.hard.pfn & 0x7FFFFFFF;
+                auto pfn_masked = pt_entries.m_pde.hard.pfn & ~( ( page_2mb_size / page_4kb_size ) - 1 );
                 *pa = ( pfn_masked << page_shift ) | ( va & page_2mb_mask );
             }
             return true;

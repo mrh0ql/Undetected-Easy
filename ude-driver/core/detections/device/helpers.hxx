@@ -174,47 +174,28 @@ namespace device_surface {
 			&object
 		);
 
+		RtlFreeUnicodeString( &unicode );
 		if ( !status && object ) {
-			RtlFreeUnicodeString( &unicode );
 			*device_object = static_cast< PDEVICE_OBJECT >( object );
 			return true;
 		}
 
-		// Device object types have a parse procedure, so a direct object-manager
-		// reference can fail even though the named device is reachable. Fall back
-		// to the I/O-manager path and retain our own reference after releasing the
-		// temporary FILE_OBJECT returned by IoGetDeviceObjectPointer.
-		PFILE_OBJECT file_object = nullptr;
-		PDEVICE_OBJECT resolved_device = nullptr;
-		status = IoGetDeviceObjectPointer(
-			&unicode,
-			FILE_READ_ATTRIBUTES,
-			&file_object,
-			&resolved_device
-		);
-		RtlFreeUnicodeString( &unicode );
-		if ( status || !file_object || !resolved_device ) {
-			if ( file_object )
-				ObDereferenceObject( file_object );
-			return false;
-		}
-
-		ObReferenceObject( resolved_device );
-		ObDereferenceObject( file_object );
-		*device_object = resolved_device;
-		return true;
+		return false;
 	}
 
 	bool module_has_executable_section( const system_module_t* module ) {
 		if ( !module || !module->m_image_base || module->m_image_size < PAGE_SIZE )
 			return false;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
-		size_t copied = 0;
-		if ( !memory::copy_kernel_memory( module->m_image_base, sizeof( header_page ), header_page, &copied ) )
+		memory::scoped_page_t header_page{ };
+		if ( !header_page )
 			return true;
 
-		auto nt_headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( module->m_image_base, PAGE_SIZE, header_page.get( ), &copied ) )
+			return true;
+
+		auto nt_headers = memory::validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !nt_headers )
 			return false;
 
@@ -343,12 +324,15 @@ namespace device_surface {
 		if ( !nt || !nt->m_image_base || nt->m_image_size < PAGE_SIZE )
 			return 0;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
-		size_t header_copied = 0;
-		if ( !memory::copy_kernel_memory( nt->m_image_base, sizeof( header_page ), header_page, &header_copied ) )
+		memory::scoped_page_t header_page{ };
+		if ( !header_page )
 			return 0;
 
-		auto headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		size_t header_copied = 0;
+		if ( !memory::copy_kernel_memory( nt->m_image_base, PAGE_SIZE, header_page.get( ), &header_copied ) )
+			return 0;
+
+		auto headers = memory::validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !headers )
 			return 0;
 
@@ -450,20 +434,29 @@ namespace device_surface::object {
 		if ( !command || !driver_object )
 			return 0;
 
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
+			return 0;
+
 		unsigned long detections = 0;
 		unsigned long devices = 0;
-		auto device = driver_object->DeviceObject;
+		auto device = drv_copy.DeviceObject;
 
 		while ( device && devices < 256 ) {
+			DEVICE_OBJECT dev_copy{ };
+			if ( !memory::copy_kernel_memory( device, sizeof( dev_copy ), &dev_copy, &copied ) )
+				break;
+
 			devices++;
-			if ( device->DriverObject != driver_object ) {
+			if ( dev_copy.DriverObject != driver_object ) {
 				char detail[ ioctl::m_detection_text_size ]{ };
 				RtlStringCbPrintfA(
 					detail,
 					sizeof( detail ),
 					"device=0x%llx driver=0x%llx expected=0x%llx index=%lu",
 					reinterpret_cast< unsigned long long >( device ),
-					reinterpret_cast< unsigned long long >( device->DriverObject ),
+					reinterpret_cast< unsigned long long >( dev_copy.DriverObject ),
 					reinterpret_cast< unsigned long long >( driver_object ),
 					devices - 1
 				);
@@ -479,10 +472,10 @@ namespace device_surface::object {
 				detections++;
 			}
 
-			device = device->NextDevice;
+			device = dev_copy.NextDevice;
 		}
 
-		if ( device ) {
+		if ( device && devices >= 256 ) {
 			char detail[ ioctl::m_detection_text_size ]{ };
 			RtlStringCbPrintfA( detail, sizeof( detail ), "driver=0x%llx device_chain_limit=256", reinterpret_cast< unsigned long long >( driver_object ) );
 			report::add_memory_detection(

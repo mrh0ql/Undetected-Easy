@@ -121,11 +121,11 @@ namespace memory_scan::permissions {
 		if ( !image || image >= available_end || available_end - image < PAGE_SIZE )
 			return false;
 
-		unsigned char header[ PAGE_SIZE ]{ };
-		if ( !copy_virtual( image, header, sizeof( header ) ) )
+		memory::scoped_page_t header{ };
+		if ( !header || !copy_virtual( image, header.get( ), PAGE_SIZE ) )
 			return false;
 
-		auto nt = memory::validate_pe_image( header, sizeof( header ) );
+		auto nt = memory::validate_pe_image( header.get( ), PAGE_SIZE );
 		if ( !nt || !nt->OptionalHeader.SizeOfImage ||
 			nt->OptionalHeader.SizeOfImage > m_max_unlisted_image_size ||
 			!nt->OptionalHeader.AddressOfEntryPoint )
@@ -187,6 +187,10 @@ namespace memory_scan::permissions {
 		if ( !modules || !start || end <= start || end - start > m_max_unlisted_image_size )
 			return evidence;
 
+		memory::scoped_page_t bytes{ };
+		if ( !bytes )
+			return evidence;
+
 		auto span = static_cast< unsigned long >( end - start );
 		for ( auto page = start; page < end; page += PAGE_SIZE ) {
 			paging::pt_entries_t entries{ };
@@ -202,14 +206,14 @@ namespace memory_scan::permissions {
 					evidence.m_executable_pages++;
 			}
 
-			unsigned char bytes[ PAGE_SIZE ]{ };
-			if ( !copy_virtual( page, bytes, sizeof( bytes ) ) )
+			memset( bytes.get( ), 0, PAGE_SIZE );
+			if ( !copy_virtual( page, bytes.get( ), PAGE_SIZE ) )
 				continue;
 
 			unsigned long import_run = 0;
 			for ( auto offset = 0ul; offset + sizeof( unsigned long long ) <= PAGE_SIZE; offset += sizeof( unsigned long long ) ) {
 				unsigned long long pointer = 0;
-				memcpy( &pointer, bytes + offset, sizeof( pointer ) );
+				memcpy( &pointer, bytes.get( ) + offset, sizeof( pointer ) );
 				auto owner = module::disk::find_module_by_address( modules, pointer );
 				if ( owner && module::disk::is_address_in_executable_section( owner, pointer, nullptr, 0 ) ) {
 					import_run++;
@@ -221,7 +225,7 @@ namespace memory_scan::permissions {
 			}
 
 			for ( auto offset = 0ul; offset + 12 <= PAGE_SIZE; offset += 4 ) {
-				auto run = unwind_run_at( bytes, PAGE_SIZE, offset, span + 0x10000ul );
+				auto run = unwind_run_at( bytes.get( ), PAGE_SIZE, offset, span + 0x10000ul );
 				if ( run > evidence.m_max_unwind_run )
 					evidence.m_max_unwind_run = run;
 			}
@@ -282,9 +286,10 @@ namespace memory_scan::permissions {
 
 		bool reported_image = false;
 		auto cursor = state->m_executable_region_start;
-		while ( cursor < state->m_executable_region_end ) {
-			unsigned char page_bytes[ PAGE_SIZE ]{ };
-			if ( !copy_virtual( cursor, page_bytes, sizeof( page_bytes ) ) ) {
+		memory::scoped_page_t page_bytes{ };
+		while ( page_bytes && cursor < state->m_executable_region_end ) {
+			memset( page_bytes.get( ), 0, PAGE_SIZE );
+			if ( !copy_virtual( cursor, page_bytes.get( ), PAGE_SIZE ) ) {
 				cursor += PAGE_SIZE;
 				continue;
 			}
@@ -295,7 +300,7 @@ namespace memory_scan::permissions {
 			unsigned long entry_rva = 0;
 			unsigned long executable_sections = 0;
 			for ( auto offset = 0ul; offset + sizeof( unsigned short ) <= PAGE_SIZE; offset += 16 ) {
-				if ( *reinterpret_cast< const unsigned short* >( page_bytes + offset ) != IMAGE_DOS_SIGNATURE )
+				if ( *reinterpret_cast< const unsigned short* >( page_bytes.get( ) + offset ) != IMAGE_DOS_SIGNATURE )
 					continue;
 
 				image = cursor + offset;

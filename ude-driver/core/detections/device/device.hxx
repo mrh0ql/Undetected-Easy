@@ -106,39 +106,68 @@ namespace device_surface::dispatch {
 	}
 
 	unsigned long scan_major_functions( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* owner_module, PDRIVER_OBJECT driver_object, const char* driver_name ) {
+		if ( !driver_object )
+			return 0;
+
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
+			return 0;
+
 		unsigned long detections = 0;
 		for ( auto index = 0ul; index <= IRP_MJ_MAXIMUM_FUNCTION; index++ ) {
 			char slot[ 32 ]{ };
 			RtlStringCbPrintfA( slot, sizeof( slot ), "mj_%s_%lu", major_name( index ), index );
-			detections += report_target( command, modules, owner_module, driver_name, slot, reinterpret_cast< void* >( driver_object->MajorFunction[ index ] ) );
+			detections += report_target( command, modules, owner_module, driver_name, slot, reinterpret_cast< void* >( drv_copy.MajorFunction[ index ] ) );
 		}
 
-		detections += report_target( command, modules, owner_module, driver_name, "driver_init", reinterpret_cast< void* >( driver_object->DriverInit ) );
-		detections += report_target( command, modules, owner_module, driver_name, "driver_unload", reinterpret_cast< void* >( driver_object->DriverUnload ) );
-		detections += report_target( command, modules, owner_module, driver_name, "add_device", reinterpret_cast< void* >( driver_object->DriverExtension ? driver_object->DriverExtension->AddDevice : nullptr ) );
+		detections += report_target( command, modules, owner_module, driver_name, "driver_init", reinterpret_cast< void* >( drv_copy.DriverInit ) );
+		detections += report_target( command, modules, owner_module, driver_name, "driver_unload", reinterpret_cast< void* >( drv_copy.DriverUnload ) );
+
+		void* add_device = nullptr;
+		if ( drv_copy.DriverExtension ) {
+			DRIVER_EXTENSION ext_copy{ };
+			if ( memory::copy_kernel_memory( drv_copy.DriverExtension, sizeof( ext_copy ), &ext_copy, &copied ) )
+				add_device = reinterpret_cast< void* >( ext_copy.AddDevice );
+		}
+		detections += report_target( command, modules, owner_module, driver_name, "add_device", add_device );
 		return detections;
 	}
 
 	unsigned long scan_fast_io( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* owner_module, PDRIVER_OBJECT driver_object, const char* driver_name ) {
-		if ( !driver_object || !driver_object->FastIoDispatch )
+		if ( !driver_object )
 			return 0;
 
-		auto fast = driver_object->FastIoDispatch;
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) || !drv_copy.FastIoDispatch )
+			return 0;
+
+		FAST_IO_DISPATCH fast{ };
+		if ( !memory::copy_kernel_memory( drv_copy.FastIoDispatch, sizeof( fast ), &fast, &copied ) )
+			return 0;
+
 		unsigned long detections = 0;
-		detections += report_target( command, modules, owner_module, driver_name, "fast_check", reinterpret_cast< void* >( fast->FastIoCheckIfPossible ) );
-		detections += report_target( command, modules, owner_module, driver_name, "fast_read", reinterpret_cast< void* >( fast->FastIoRead ) );
-		detections += report_target( command, modules, owner_module, driver_name, "fast_write", reinterpret_cast< void* >( fast->FastIoWrite ) );
-		detections += report_target( command, modules, owner_module, driver_name, "fast_ioctl", reinterpret_cast< void* >( fast->FastIoDeviceControl ) );
+		detections += report_target( command, modules, owner_module, driver_name, "fast_check", reinterpret_cast< void* >( fast.FastIoCheckIfPossible ) );
+		detections += report_target( command, modules, owner_module, driver_name, "fast_read", reinterpret_cast< void* >( fast.FastIoRead ) );
+		detections += report_target( command, modules, owner_module, driver_name, "fast_write", reinterpret_cast< void* >( fast.FastIoWrite ) );
+		detections += report_target( command, modules, owner_module, driver_name, "fast_ioctl", reinterpret_cast< void* >( fast.FastIoDeviceControl ) );
 		return detections;
 	}
 
 	unsigned long scan_ioctl_shape( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* owner_module, PDRIVER_OBJECT driver_object, const char* driver_name ) {
-		if ( !command || !driver_object || !driver_object->MajorFunction[ IRP_MJ_DEVICE_CONTROL ] )
+		UNREFERENCED_PARAMETER( owner_module );
+		if ( !command || !driver_object )
+			return 0;
+
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) || !drv_copy.MajorFunction[ IRP_MJ_DEVICE_CONTROL ] )
 			return 0;
 
 		target_info_t info{ };
 		auto device_control = reinterpret_cast< unsigned long long >(
-			driver_object->MajorFunction[ IRP_MJ_DEVICE_CONTROL ] );
+			drv_copy.MajorFunction[ IRP_MJ_DEVICE_CONTROL ] );
 		query_target_info( modules, device_control, &info );
 
 		if ( !info.m_module || detections::is_suspicious_external_target( modules, info.m_module, device_control ) ) {
@@ -241,7 +270,7 @@ namespace device_surface::dispatch {
 		//	reinterpret_cast< unsigned long long >( ioctl_target ),
 		//	sizeof( void* )
 		//);
-		return 1;
+		return 0;
 	}
 }
 
@@ -272,19 +301,31 @@ namespace device_surface {
 		if ( !driver_object || !module )
 			return false;
 
-		auto driver_start = reinterpret_cast< unsigned long long >( driver_object->DriverStart );
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
+			return false;
+
+		auto driver_start = reinterpret_cast< unsigned long long >( drv_copy.DriverStart );
 		auto module_start = reinterpret_cast< unsigned long long >( module->m_image_base );
-		return driver_start == module_start && driver_object->DriverSize == module->m_image_size;
+		return driver_start == module_start && drv_copy.DriverSize == module->m_image_size;
 	}
 
 	unsigned long report_driver_object_mismatch( ioctl::command_t* command, PDRIVER_OBJECT driver_object, const system_module_t* module, const char* driver_name ) {
 		if ( !command || !driver_object || !module )
 			return 0;
 
-		if ( driver_object_matches_module( driver_object, module ) )
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
 			return 0;
 
-		if ( !driver_object->DriverSize )
+		auto driver_start = reinterpret_cast< unsigned long long >( drv_copy.DriverStart );
+		auto module_start = reinterpret_cast< unsigned long long >( module->m_image_base );
+		if ( driver_start == module_start && drv_copy.DriverSize == module->m_image_size )
+			return 0;
+
+		if ( !drv_copy.DriverSize )
 			return 0;
 
 		char detail[ ioctl::m_detection_text_size ]{ };
@@ -292,9 +333,9 @@ namespace device_surface {
 			detail,
 			sizeof( detail ),
 			"driver_start=0x%llx driver_size=0x%lx module_base=0x%llx module_size=0x%lx",
-			reinterpret_cast< unsigned long long >( driver_object->DriverStart ),
-			driver_object->DriverSize,
-			reinterpret_cast< unsigned long long >( module->m_image_base ),
+			driver_start,
+			drv_copy.DriverSize,
+			module_start,
 			module->m_image_size
 		);
 
@@ -313,15 +354,19 @@ namespace device_surface {
 		if ( !command || !driver_object )
 			return 0;
 
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied );
+
 		char detail[ ioctl::m_detection_text_size ]{ };
 		RtlStringCbPrintfA(
 			detail,
 			sizeof( detail ),
 			"driver=0x%llx section=0x%llx start=0x%llx size=0x%lx module_base=0x%llx module_size=0x%lx reason=%s",
 			reinterpret_cast< unsigned long long >( driver_object ),
-			reinterpret_cast< unsigned long long >( driver_object->DriverSection ),
-			reinterpret_cast< unsigned long long >( driver_object->DriverStart ),
-			driver_object->DriverSize,
+			reinterpret_cast< unsigned long long >( drv_copy.DriverSection ),
+			reinterpret_cast< unsigned long long >( drv_copy.DriverStart ),
+			drv_copy.DriverSize,
 			module ? reinterpret_cast< unsigned long long >( module->m_image_base ) : 0ull,
 			module ? module->m_image_size : 0ul,
 			reason ? reason : "driver section consistency"
@@ -345,15 +390,20 @@ namespace device_surface {
 		if ( module && is_system_module_path( module ) )
 			return 0;
 
-		if ( !driver_object->DriverSection )
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
+			return 0;
+
+		if ( !drv_copy.DriverSection )
 			return report_driver_section_mismatch( command, driver_object, module, driver_name, "driver object has no loader section" );
 
 		loader_module_entry_t entry{ };
-		if ( !read_loader_entry( static_cast< LIST_ENTRY* >( driver_object->DriverSection ), &entry ) )
+		if ( !read_loader_entry( static_cast< LIST_ENTRY* >( drv_copy.DriverSection ), &entry ) )
 			return report_driver_section_mismatch( command, driver_object, module, driver_name, "driver section is not readable loader entry" );
 
 		auto section_base = reinterpret_cast< unsigned long long >( entry.m_dll_base );
-		auto driver_start = reinterpret_cast< unsigned long long >( driver_object->DriverStart );
+		auto driver_start = reinterpret_cast< unsigned long long >( drv_copy.DriverStart );
 		auto module_base = module ? reinterpret_cast< unsigned long long >( module->m_image_base ) : 0ull;
 		if ( driver_start && section_base && section_base != driver_start )
 			return report_driver_section_mismatch( command, driver_object, module, driver_name, "driver section base disagrees with driver start" );
@@ -361,7 +411,7 @@ namespace device_surface {
 		if ( module_base && section_base && section_base != module_base )
 			return report_driver_section_mismatch( command, driver_object, module, driver_name, "driver section base disagrees with module query" );
 
-		if ( driver_object->DriverSize && entry.m_size_of_image && driver_object->DriverSize != entry.m_size_of_image )
+		if ( drv_copy.DriverSize && entry.m_size_of_image && drv_copy.DriverSize != entry.m_size_of_image )
 			return report_driver_section_mismatch( command, driver_object, module, driver_name, "driver section size disagrees with driver object" );
 
 		if ( module && entry.m_size_of_image && module->m_image_size != entry.m_size_of_image )
@@ -422,10 +472,15 @@ namespace device_surface {
 	}
 
 	const system_module_t* find_driver_owner_module( const system_modules_t* modules, PDRIVER_OBJECT driver_object ) {
-		if ( !modules || !driver_object || !driver_object->DriverStart )
+		if ( !modules || !driver_object )
 			return nullptr;
 
-		auto start = reinterpret_cast< unsigned long long >( driver_object->DriverStart );
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) || !drv_copy.DriverStart )
+			return nullptr;
+
+		auto start = reinterpret_cast< unsigned long long >( drv_copy.DriverStart );
 		for ( auto index = 0ul; index < modules->m_count; index++ ) {
 			auto module = &modules->m_modules[ index ];
 			auto base = reinterpret_cast< unsigned long long >( module->m_image_base );
@@ -439,6 +494,11 @@ namespace device_surface {
 
 	const system_module_t* find_trusted_dispatch_host_module( const system_modules_t* modules, PDRIVER_OBJECT driver_object ) {
 		if ( !modules || !driver_object )
+			return nullptr;
+
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
 			return nullptr;
 
 		const system_module_t* host = nullptr;
@@ -460,14 +520,20 @@ namespace device_surface {
 		};
 
 		for ( auto index = 0ul; index <= IRP_MJ_MAXIMUM_FUNCTION; index++ ) {
-			if ( !accept_target( reinterpret_cast< void* >( driver_object->MajorFunction[ index ] ) ) )
+			if ( !accept_target( reinterpret_cast< void* >( drv_copy.MajorFunction[ index ] ) ) )
 				return nullptr;
 		}
 
-		if ( !accept_target( reinterpret_cast< void* >( driver_object->DriverInit ) ) ||
-			!accept_target( reinterpret_cast< void* >( driver_object->DriverUnload ) ) ||
-			!accept_target( reinterpret_cast< void* >(
-				driver_object->DriverExtension ? driver_object->DriverExtension->AddDevice : nullptr ) ) )
+		void* add_device = nullptr;
+		if ( drv_copy.DriverExtension ) {
+			DRIVER_EXTENSION ext_copy{ };
+			if ( memory::copy_kernel_memory( drv_copy.DriverExtension, sizeof( ext_copy ), &ext_copy, &copied ) )
+				add_device = reinterpret_cast< void* >( ext_copy.AddDevice );
+		}
+
+		if ( !accept_target( reinterpret_cast< void* >( drv_copy.DriverInit ) ) ||
+			!accept_target( reinterpret_cast< void* >( drv_copy.DriverUnload ) ) ||
+			!accept_target( add_device ) )
 			return nullptr;
 
 		return host;
@@ -477,14 +543,24 @@ namespace device_surface {
 		if ( !driver_object )
 			return false;
 
-		const auto missing_backing = !driver_object->DriverStart ||
-			!driver_object->DriverSize ||
-			!driver_object->DriverSection;
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
+			return false;
+
+		const auto missing_backing = !drv_copy.DriverStart ||
+			!drv_copy.DriverSize ||
+			!drv_copy.DriverSection;
 		return missing_backing;
 	}
 
 	unsigned long scan_driver_object( ioctl::command_t* command, const system_modules_t* modules, const system_module_t* module, PDRIVER_OBJECT driver_object, const char* driver_name ) {
 		if ( !command || !modules || !driver_object )
+			return 0;
+
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) )
 			return 0;
 
 		unsigned long detections = 0;
@@ -498,9 +574,9 @@ namespace device_surface {
 				"name=%s driver=0x%llx start=0x%llx size=0x%lx devices=0x%llx",
 				driver_name ? driver_name : "unknown",
 				reinterpret_cast< unsigned long long >( driver_object ),
-				reinterpret_cast< unsigned long long >( driver_object->DriverStart ),
-				driver_object->DriverSize,
-				reinterpret_cast< unsigned long long >( driver_object->DeviceObject )
+				reinterpret_cast< unsigned long long >( drv_copy.DriverStart ),
+				drv_copy.DriverSize,
+				reinterpret_cast< unsigned long long >( drv_copy.DeviceObject )
 			);
 
 			report::add_memory_detection(
@@ -594,6 +670,13 @@ namespace device_surface {
 		if ( !command || !device_object || !driver_object )
 			return 0;
 
+		DRIVER_OBJECT drv_copy{ };
+		DEVICE_OBJECT dev_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( driver_object, sizeof( drv_copy ), &drv_copy, &copied ) ||
+			!memory::copy_kernel_memory( device_object, sizeof( dev_copy ), &dev_copy, &copied ) )
+			return 0;
+
 		char target[ ioctl::m_detection_target_size ]{ };
 		char detail[ ioctl::m_detection_text_size ]{ };
 		RtlStringCbPrintfA( target, sizeof( target ), "device!%s", name && name[ 0 ] ? name : "object" );
@@ -603,12 +686,12 @@ namespace device_surface {
 			"device=0x%llx driver=0x%llx driver_start=0x%llx driver_size=0x%lx driver_section=0x%llx name_length=%u flags=0x%lx type=0x%lx",
 			reinterpret_cast< unsigned long long >( device_object ),
 			reinterpret_cast< unsigned long long >( driver_object ),
-			reinterpret_cast< unsigned long long >( driver_object->DriverStart ),
-			driver_object->DriverSize,
-			reinterpret_cast< unsigned long long >( driver_object->DriverSection ),
-			static_cast< unsigned long >( driver_object->DriverName.Length ),
-			device_object->Flags,
-			device_object->DeviceType
+			reinterpret_cast< unsigned long long >( drv_copy.DriverStart ),
+			drv_copy.DriverSize,
+			reinterpret_cast< unsigned long long >( drv_copy.DriverSection ),
+			static_cast< unsigned long >( drv_copy.DriverName.Length ),
+			dev_copy.Flags,
+			dev_copy.DeviceType
 		);
 
 		report::add_memory_detection(
@@ -634,7 +717,12 @@ namespace device_surface {
 		if ( !command || !modules || !device_object || !scanned || !scanned_count )
 			return 0;
 
-		auto driver_object = device_object->DriverObject;
+		DEVICE_OBJECT dev_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( device_object, sizeof( dev_copy ), &dev_copy, &copied ) )
+			return 0;
+
+		auto driver_object = dev_copy.DriverObject;
 		if ( !driver_object )
 			return 0;
 
@@ -777,12 +865,15 @@ namespace device_surface {
 		if ( entry_point && ( entry_point < base || entry_point >= base + entry.m_size_of_image ) )
 			return false;
 
-		unsigned char header_page[ PAGE_SIZE ]{ };
-		size_t copied = 0;
-		if ( !memory::copy_kernel_memory( entry.m_dll_base, sizeof( header_page ), header_page, &copied ) )
+		memory::scoped_page_t header_page{ };
+		if ( !header_page )
 			return true;
 
-		auto headers = memory::validate_pe_image( header_page, sizeof( header_page ) );
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( entry.m_dll_base, PAGE_SIZE, header_page.get( ), &copied ) )
+			return true;
+
+		auto headers = memory::validate_pe_image( header_page.get( ), PAGE_SIZE );
 		if ( !headers )
 			return false;
 
@@ -1284,14 +1375,23 @@ namespace device_surface {
 		if ( !command || !modules || !base_device )
 			return 0;
 
+		DEVICE_OBJECT base_copy{ };
+		size_t copied = 0;
+		if ( !memory::copy_kernel_memory( base_device, sizeof( base_copy ), &base_copy, &copied ) )
+			return 0;
+
 		unsigned long detections = 0;
-		auto attached = base_device->AttachedDevice;
+		auto attached = base_copy.AttachedDevice;
 		for ( auto depth = 0ul; attached && depth < 32ul; depth++ ) {
 			if ( !memory::is_canonical_kernel_address( reinterpret_cast< unsigned long long >( attached ) ) )
 				break;
 
+			DEVICE_OBJECT att_copy{ };
+			if ( !memory::copy_kernel_memory( attached, sizeof( att_copy ), &att_copy, &copied ) )
+				break;
+
 			detections += scan_referenced_device( command, modules, base_label, attached, scanned, scanned_count );
-			attached = attached->AttachedDevice;
+			attached = att_copy.AttachedDevice;
 		}
 
 		return detections;
@@ -1360,8 +1460,19 @@ namespace device_surface {
 						detections += scan_driver_object( command, modules, owner_mod, drv, object_name );
 					remember_scanned_driver( scanned, scanned_count, drv );
 				}
-				for ( auto dev = drv->DeviceObject; dev; dev = dev->NextDevice )
-					detections += scan_attached_stack( command, modules, object_name, dev, scanned, scanned_count );
+
+				DRIVER_OBJECT drv_copy{ };
+				size_t copied = 0;
+				if ( memory::copy_kernel_memory( drv, sizeof( drv_copy ), &drv_copy, &copied ) ) {
+					auto dev = drv_copy.DeviceObject;
+					for ( auto dev_walk = 0ul; dev && dev_walk < 128ul; dev_walk++ ) {
+						DEVICE_OBJECT dev_copy{ };
+						if ( !memory::copy_kernel_memory( dev, sizeof( dev_copy ), &dev_copy, &copied ) )
+							break;
+						detections += scan_attached_stack( command, modules, object_name, dev, scanned, scanned_count );
+						dev = dev_copy.NextDevice;
+					}
+				}
 			}
 			else {
 				auto dev = static_cast< PDEVICE_OBJECT >( obj );
@@ -1387,9 +1498,18 @@ namespace device_surface {
 			return 0;
 
 		unsigned long detections = 0;
-		unsigned long walked = 0;
-		for ( auto dev = pci_driver->DeviceObject; dev && walked < 256ul; dev = dev->NextDevice, walked++ )
-			detections += scan_attached_stack( command, modules, "pci_stack", dev, scanned, scanned_count );
+		DRIVER_OBJECT drv_copy{ };
+		size_t copied = 0;
+		if ( memory::copy_kernel_memory( pci_driver, sizeof( drv_copy ), &drv_copy, &copied ) ) {
+			auto dev = drv_copy.DeviceObject;
+			for ( auto walked = 0ul; dev && walked < 256ul; walked++ ) {
+				DEVICE_OBJECT dev_copy{ };
+				if ( !memory::copy_kernel_memory( dev, sizeof( dev_copy ), &dev_copy, &copied ) )
+					break;
+				detections += scan_attached_stack( command, modules, "pci_stack", dev, scanned, scanned_count );
+				dev = dev_copy.NextDevice;
+			}
+		}
 
 		ObDereferenceObject( pci_driver );
 		return detections;
@@ -1792,10 +1912,16 @@ namespace device_surface {
 			if ( !reference_driver_object( driver_name, &drv ) || !drv )
 				continue;
 
+			DRIVER_OBJECT drv_copy{ };
+			if ( !memory::copy_kernel_memory( drv, sizeof( drv_copy ), &drv_copy, &copied ) ) {
+				ObDereferenceObject( drv );
+				continue;
+			}
+
 			auto owner_mod = find_driver_owner_module( modules, drv );
 			for ( auto slot_idx = 0ul; slot_idx < ARRAYSIZE( monitored_slots ); slot_idx++ ) {
 				const auto mj = monitored_slots[ slot_idx ];
-				auto handler_va = reinterpret_cast< unsigned long long >( drv->MajorFunction[ mj ] );
+				auto handler_va = reinterpret_cast< unsigned long long >( drv_copy.MajorFunction[ mj ] );
 				if ( !handler_va )
 					continue;
 
@@ -1878,9 +2004,14 @@ namespace device_surface {
 				detections++;
 			}
 
-			auto dev_walked = 0ul;
-			for ( auto dev = drv->DeviceObject; dev && dev_walked < 128ul; dev = dev->NextDevice, dev_walked++ )
+			auto dev = drv_copy.DeviceObject;
+			for ( auto dev_walked = 0ul; dev && dev_walked < 128ul; dev_walked++ ) {
+				DEVICE_OBJECT dev_copy{ };
+				if ( !memory::copy_kernel_memory( dev, sizeof( dev_copy ), &dev_copy, &copied ) )
+					break;
 				detections += scan_attached_stack( command, modules, driver_name, dev, scanned, scanned_count );
+				dev = dev_copy.NextDevice;
+			}
 
 			ObDereferenceObject( drv );
 		}
@@ -1892,10 +2023,17 @@ namespace device_surface {
 		if ( !command || !modules )
 			return false;
 
+		auto scanned_drivers = memory::allocate_pool< PDRIVER_OBJECT* >( 512 * sizeof( PDRIVER_OBJECT ), 1 );
+		if ( !scanned_drivers ) {
+			command->m_result = false;
+			command->m_error = STATUS_INSUFFICIENT_RESOURCES;
+			return false;
+		}
+		memset( scanned_drivers, 0, 512 * sizeof( PDRIVER_OBJECT ) );
+
 		unsigned long resolved = 0;
 		unsigned long driver_objects = 0;
 		unsigned long detections = 0;
-		PDRIVER_OBJECT scanned_drivers[ 512 ]{ };
 		unsigned long scanned_driver_count = 0;
 
 		for ( auto index = 0ul; index < modules->m_count; index++ ) {
@@ -1932,6 +2070,8 @@ namespace device_surface {
 		detections += scan_pi_ddb_cache_table( command );
 		detections += scan_ci_hash_bucket_list( command );
 		detections += scan_ci_dse_state( command );
+
+		memory::free_pool( scanned_drivers );
 
 		utility::print(
 			"device surface: modules=%lu resolved_drivers=%lu driver_objects=%lu detections=%lu\n",

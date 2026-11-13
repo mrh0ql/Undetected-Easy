@@ -190,14 +190,18 @@ namespace pool_integrity {
 		if ( allocation_end <= allocation_base )
 			return false;
 
+		memory::scoped_page_t bytes{ };
+		if ( !bytes )
+			return false;
+
 		for ( auto page = allocation_base; page < allocation_end; page += PAGE_SIZE ) {
-			unsigned char bytes[ PAGE_SIZE ]{ };
+			memset( bytes.get( ), 0, PAGE_SIZE );
 			size_t copied = 0;
-			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( page ), sizeof( bytes ), bytes, &copied ) )
+			if ( !memory::copy_kernel_memory( reinterpret_cast< void* >( page ), PAGE_SIZE, bytes.get( ), &copied ) )
 				continue;
 
 			for ( auto offset = 0ul; offset + sizeof( unsigned short ) <= PAGE_SIZE; offset += 16 ) {
-				if ( *reinterpret_cast< const unsigned short* >( bytes + offset ) != IMAGE_DOS_SIGNATURE )
+				if ( *reinterpret_cast< const unsigned short* >( bytes.get( ) + offset ) != IMAGE_DOS_SIGNATURE )
 					continue;
 
 				auto candidate = page + offset;
@@ -246,10 +250,10 @@ namespace pool_integrity {
 		auto executable = permissions.m_executable;
 		bool reported_pe_image = false;
 
-		unsigned char bytes[ m_scan_bytes ]{ };
+		memory::scoped_page_t bytes{ };
 		size_t copied = 0;
-		auto read_size = size < sizeof( bytes ) ? size : sizeof( bytes );
-		if ( memory::copy_kernel_memory( reinterpret_cast< void* >( address ), read_size, bytes, &copied ) && copied >= 2 ) {
+		auto read_size = size < PAGE_SIZE ? size : PAGE_SIZE;
+		if ( bytes && memory::copy_kernel_memory( reinterpret_cast< void* >( address ), read_size, bytes.get( ), &copied ) && copied >= 2 ) {
 			unsigned long long mapped_image = 0;
 			unsigned long mapped_image_size = 0;
 			auto pe_image = find_mapped_pe_image( address, size, &mapped_image, &mapped_image_size );
@@ -265,12 +269,12 @@ namespace pool_integrity {
 			// Preserve this as candidate telemetry, but require a PE image or an
 			// active execution reference from another scanner before reporting it.
 			if ( executable && !noisy_tag &&
-				has_code_signature( modules, bytes, static_cast< unsigned long >( copied ), address, size ) )
+				has_code_signature( modules, bytes.get( ), static_cast< unsigned long >( copied ), address, size ) )
 				command->m_signature_candidates++;
 
-			if ( copied >= sizeof( KDPC ) && dpc_integrity::is_plausible_dpc( reinterpret_cast< KDPC* >( bytes ) ) ) {
+			if ( copied >= sizeof( KDPC ) && dpc_integrity::is_plausible_dpc( reinterpret_cast< KDPC* >( bytes.get( ) ) ) ) {
 				command->m_signature_candidates++;
-				detections += dpc_integrity::inspect_candidate( command, modules, reinterpret_cast< KDPC* >( bytes ), "bigpool" );
+				detections += dpc_integrity::inspect_candidate( command, modules, reinterpret_cast< KDPC* >( bytes.get( ) ), "bigpool" );
 			}
 		}
 
