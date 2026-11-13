@@ -178,6 +178,50 @@ namespace service {
 			return true;
 		}
 
+		bool load_target_driver( const wchar_t* target_sys_path, std::wstring* out_service_name = nullptr ) {
+			if ( !target_sys_path || !target_sys_path[ 0 ] )
+				return false;
+
+			load_driver_privilage( true );
+
+			wchar_t resolved_path[ MAX_PATH ]{};
+			const wchar_t* prefix = obf( L"\\??\\" );
+			const wchar_t* raw_path = target_sys_path;
+			if ( std::wcsncmp( raw_path, prefix, std::wcslen( prefix ) ) == 0 )
+				raw_path += std::wcslen( prefix );
+
+			if ( GetFullPathNameW( raw_path, MAX_PATH, resolved_path, nullptr ) == 0 )
+				wcscpy_s( resolved_path, raw_path );
+
+			wchar_t nt_path[ MAX_PATH ]{};
+			wcscpy_s( nt_path, prefix );
+			wcscat_s( nt_path, resolved_path );
+
+			const wchar_t* file_name = std::wcsrchr( resolved_path, L'\\' );
+			if ( !file_name )
+				file_name = std::wcsrchr( resolved_path, L'/' );
+			file_name = file_name ? file_name + 1 : resolved_path;
+
+			wchar_t srv_name[ MAX_PATH ]{};
+			wcscpy_s( srv_name, file_name );
+			wchar_t* extension = std::wcsrchr( srv_name, L'.' );
+			if ( extension )
+				*extension = L'\0';
+
+			if ( out_service_name )
+				*out_service_name = srv_name;
+
+			return install_service( srv_name, nt_path );
+		}
+
+		bool unload_target_driver( const wchar_t* service_name ) {
+			if ( !service_name || !service_name[ 0 ] )
+				return false;
+
+			load_driver_privilage( true );
+			return uninstall_service( service_name );
+		}
+
 	private:
 		wchar_t m_driver_name[ MAX_PATH ]{ };
 		wchar_t m_driver_path[ MAX_PATH ]{ };

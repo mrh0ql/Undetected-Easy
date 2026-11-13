@@ -23,7 +23,7 @@ namespace render::widgets::stages {
 	inline std::mutex g_dashboard_setup_mutex;
 	inline std::wstring g_dashboard_driver_path;
 	inline std::array< std::atomic_bool, 10 > g_dashboard_scan_selected{
-		true, true, true, false, true, true, true, true, true, true
+		true, true, true, true, true, true, true, true, true, true
 	};
 	inline std::atomic_bool g_dashboard_scan_selection_submitted = false;
 	inline std::atomic< float > g_dashboard_scan_progress = 0.0f;

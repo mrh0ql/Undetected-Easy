@@ -203,7 +203,29 @@ const char* source_fix_for_detection( const driver::detection_t& detection ) {
 	return obf( "" );
 }
 
+inline std::wstring g_target_driver_path;
+inline std::wstring g_target_service_name;
+inline bool g_target_driver_loaded = false;
+inline std::wstring g_target_usermode_path;
+inline HANDLE g_target_process_handle = nullptr;
+inline DWORD g_target_process_id = 0;
+
+void cleanup_targets( ) {
+	if ( g_target_process_handle ) {
+		TerminateProcess( g_target_process_handle, 0 );
+		CloseHandle( g_target_process_handle );
+		g_target_process_handle = nullptr;
+		g_target_process_id = 0;
+	}
+	if ( g_target_driver_loaded && !g_target_service_name.empty( ) ) {
+		g_service->unload_target_driver( g_target_service_name.c_str( ) );
+		g_target_driver_loaded = false;
+	}
+}
+
 bool unload_handler( std::uint32_t signal ) {
+	UNREFERENCED_PARAMETER( signal );
+	cleanup_targets( );
 	g_driver->close( );
 	g_service->unload( );
 	g_overlay->stop( );
@@ -230,25 +252,50 @@ int wmain( int argc, wchar_t** argv ) {
         );
     }
 	std::wstring driver_path;
-	if ( argc >= 2 && argv[ 1 ] && argv[ 1 ][ 0 ] ) {
-		wchar_t full_path[ MAX_PATH ]{};
-		if ( GetFullPathNameW( argv[ 1 ], MAX_PATH, full_path, nullptr ) )
-			driver_path = full_path;
-		else
-			driver_path = argv[ 1 ];
+	wchar_t exe_file[ MAX_PATH ]{};
+	if ( GetModuleFileNameW( nullptr, exe_file, MAX_PATH ) ) {
+		std::wstring candidate( exe_file );
+		const auto sep = candidate.find_last_of( L"\\/" );
+		if ( sep != std::wstring::npos )
+			candidate.resize( sep + 1 );
+		candidate += L"ude-driver.sys";
+		if ( GetFileAttributesW( candidate.c_str( ) ) != INVALID_FILE_ATTRIBUTES )
+			driver_path = std::move( candidate );
 	}
-	else {
-		wchar_t exe_file[ MAX_PATH ]{};
-		if ( GetModuleFileNameW( nullptr, exe_file, MAX_PATH ) ) {
-			std::wstring candidate( exe_file );
-			const auto sep = candidate.find_last_of( L"\\/" );
-			if ( sep != std::wstring::npos )
-				candidate.resize( sep + 1 );
-			candidate += L"ude-driver.sys";
-			if ( GetFileAttributesW( candidate.c_str( ) ) != INVALID_FILE_ATTRIBUTES )
-				driver_path = std::move( candidate );
+	if ( driver_path.empty( ) ) {
+		wchar_t cwd_candidate[ MAX_PATH ]{};
+		if ( GetFullPathNameW( L"ude-driver.sys", MAX_PATH, cwd_candidate, nullptr ) &&
+			GetFileAttributesW( cwd_candidate ) != INVALID_FILE_ATTRIBUTES )
+			driver_path = cwd_candidate;
+	}
+
+	for ( int i = 1; i < argc; ++i ) {
+		if ( !argv[ i ] || !argv[ i ][ 0 ] )
+			continue;
+
+		wchar_t full_path[ MAX_PATH ]{};
+		std::wstring resolved = GetFullPathNameW( argv[ i ], MAX_PATH, full_path, nullptr )
+			? std::wstring( full_path )
+			: std::wstring( argv[ i ] );
+
+		const auto slash = resolved.find_last_of( L"\\/" );
+		std::wstring base_name = ( slash != std::wstring::npos ) ? resolved.substr( slash + 1 ) : resolved;
+		const auto dot = base_name.find_last_of( L'.' );
+		std::wstring ext = ( dot != std::wstring::npos ) ? base_name.substr( dot ) : L"";
+
+		if ( _wcsicmp( base_name.c_str( ), L"ude-driver.sys" ) == 0 ) {
+			driver_path = std::move( resolved );
+		}
+		else if ( _wcsicmp( ext.c_str( ), L".sys" ) == 0 ) {
+			g_target_driver_path = std::move( resolved );
+			utility::print( obf( "[ + ]" ), obf( "staged target driver: %ls" ), g_target_driver_path.c_str( ) );
+		}
+		else if ( _wcsicmp( ext.c_str( ), L".exe" ) == 0 ) {
+			g_target_usermode_path = std::move( resolved );
+			utility::print( obf( "[ + ]" ), obf( "staged target usermode: %ls" ), g_target_usermode_path.c_str( ) );
 		}
 	}
+
 	render::widgets::stages::set_dashboard_driver_path( driver_path );
 
 	if ( !g_overlay->start( render::draw_callback ) ) {
@@ -272,6 +319,75 @@ int wmain( int argc, wchar_t** argv ) {
 			break;
 
 		std::this_thread::sleep_for( std::chrono::milliseconds( 16 ) );
+	}
+
+	if ( !g_target_driver_path.empty( ) ) {
+		if ( g_service->load_target_driver( g_target_driver_path.c_str( ), &g_target_service_name ) ) {
+			g_target_driver_loaded = true;
+			utility::print(
+				obf( "[ + ]" ),
+				obf( "loaded target driver via SCM: %ls (service: %ls)" ),
+				g_target_driver_path.c_str( ),
+				g_target_service_name.c_str( )
+			);
+		}
+		else {
+			utility::print(
+				obf( "[ * ]" ),
+				obf( "target driver could not be started via SCM (unsigned or custom entry); passing to target usermode if specified" )
+			);
+		}
+	}
+
+	if ( !g_target_usermode_path.empty( ) ) {
+		std::wstring cmd_line = L"\"" + g_target_usermode_path + L"\"";
+		if ( !g_target_driver_path.empty( ) )
+			cmd_line += L" \"" + g_target_driver_path + L"\"";
+
+		std::wstring work_dir = g_target_usermode_path;
+		const auto dir_sep = work_dir.find_last_of( L"\\/" );
+		if ( dir_sep != std::wstring::npos )
+			work_dir.resize( dir_sep );
+		else
+			work_dir.clear( );
+
+		STARTUPINFOW si{};
+		si.cb = sizeof( si );
+		PROCESS_INFORMATION pi{};
+		std::vector< wchar_t > mutable_cmd( cmd_line.begin( ), cmd_line.end( ) );
+		mutable_cmd.push_back( L'\0' );
+
+		if ( CreateProcessW(
+			g_target_usermode_path.c_str( ),
+			mutable_cmd.data( ),
+			nullptr,
+			nullptr,
+			FALSE,
+			CREATE_NEW_CONSOLE,
+			nullptr,
+			work_dir.empty( ) ? nullptr : work_dir.c_str( ),
+			&si,
+			&pi
+		) ) {
+			CloseHandle( pi.hThread );
+			g_target_process_handle = pi.hProcess;
+			g_target_process_id = pi.dwProcessId;
+			utility::print(
+				obf( "[ + ]" ),
+				obf( "launched target usermode: %ls (pid: %lu)" ),
+				g_target_usermode_path.c_str( ),
+				g_target_process_id
+			);
+			std::this_thread::sleep_for( std::chrono::milliseconds( 1500 ) );
+		}
+		else {
+			utility::print(
+				obf( "[ - ]" ),
+				obf( "failed to launch target usermode (%ls): error 0x%lx" ),
+				g_target_usermode_path.c_str( ),
+				GetLastError( )
+			);
+		}
 	}
 
 	std::thread( [ ] {
@@ -372,6 +488,7 @@ int wmain( int argc, wchar_t** argv ) {
 		std::this_thread::sleep_for( std::chrono::milliseconds( 16 ) );
 
 	if ( !g_overlay->running( ) ) {
+		cleanup_targets( );
 		g_driver->close( );
 		g_service->unload( );
 		return 0;
@@ -390,6 +507,7 @@ int wmain( int argc, wchar_t** argv ) {
 	);
 
 	auto cleanup = [ ]( ) {
+		cleanup_targets( );
 		g_driver->close( );
 		g_service->unload( );
 		};
@@ -668,6 +786,7 @@ int wmain( int argc, wchar_t** argv ) {
 		}
 	}
 
+	cleanup_targets( );
 	g_driver->close( );
 	g_service->unload( );
 	utility::print( obf( "[ - ]" ), obf( "unloaded service" ) );
